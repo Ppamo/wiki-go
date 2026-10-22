@@ -1,39 +1,38 @@
-# Build stage
-FROM docker.io/library/golang:1.26.5-alpine3.24 AS builder
-
-RUN apk add --no-cache build-base git gcc musl-dev && rm -rf /var/cache/apk/*
+# Build stage: produce a fully static binary (no CGO, no libc dependency)
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.5-alpine3.24 AS builder
 
 WORKDIR /app
-
-COPY go.mod go.sum vendor/ ./
 
 COPY . .
 
 ARG VERSION=dev
-RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -a -installsuffix cgo -ldflags="-s -w -X 'wiki-go/internal/version.Version=${VERSION}'" -o wiki-go .
+ARG TARGETOS=linux
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -mod=vendor -trimpath -tags netgo,osusergo \
+    -ldflags="-s -w -extldflags '-static' -X 'wiki-go/internal/version.Version=${VERSION}'" \
+    -o wiki-go .
 
-# Final stage
-FROM docker.io/library/alpine:3.23
+# Empty data directory so an anonymous volume is writable by the runtime user
+RUN mkdir -p /out/wiki/data
 
-RUN apk add --no-cache bash ca-certificates curl linux-pam tzdata && rm -rf /var/cache/apk/*
+# Final stage: empty image containing only the binary
+FROM scratch
 
 ARG PUID=1000
 ARG PGID=1000
 
-RUN addgroup -g ${PGID} appgroup && adduser -u ${PUID} -G appgroup -s /bin/bash -D appuser
-
 WORKDIR /wiki
 
-RUN mkdir -p /wiki/data && chown -R appuser:appgroup /wiki && chmod -R 755 /wiki
+COPY --from=builder --chown=${PUID}:${PGID} /out/wiki/data /wiki/data
+COPY --from=builder --chmod=755 /app/wiki-go /wiki/wiki-go
 
-COPY --chown=appuser:appgroup --chmod=755 --from=builder /app/wiki-go .
-
-USER appuser
+USER ${PUID}:${PGID}
 
 EXPOSE 8080 443
 
 VOLUME ["/wiki/data"]
 
-ENTRYPOINT ["./wiki-go"]
+ENTRYPOINT ["/wiki/wiki-go"]
 
 CMD []
