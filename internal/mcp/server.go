@@ -17,6 +17,12 @@ import (
 	"wiki-go/internal/version"
 )
 
+// serverInstructions tells agents how the tools fit together.
+const serverInstructions = "Wiki-Go documents are Markdown pages addressed by path, " +
+	"for example \"guides/intro\"; \"/\" is the home page. Find documents with " +
+	"search_documents or browse them with list_documents, then read one with read_document. " +
+	"Results only include the documents your role and groups may access."
+
 // LatestProtocolVersion is offered to clients that ask for an unknown version.
 const LatestProtocolVersion = "2025-06-18"
 
@@ -172,7 +178,7 @@ func (s *Server) dispatch(ctx context.Context, req rpcRequest) (interface{}, *rp
 	case "ping":
 		return map[string]interface{}{}, nil
 	case "tools/list":
-		return map[string]interface{}{"tools": toolDefinitions()}, nil
+		return map[string]interface{}{"tools": toolDefinitions(SessionFromContext(ctx))}, nil
 	case "tools/call":
 		return s.callTool(ctx, req.Params)
 	default:
@@ -204,6 +210,7 @@ func (s *Server) initialize(params json.RawMessage) (interface{}, *rpcError) {
 			"title":   s.cfg.Wiki.Title,
 			"version": version.Version,
 		},
+		"instructions": serverInstructions,
 	}, nil
 }
 
@@ -216,28 +223,36 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (interfac
 		return nil, &rpcError{codeInvalidParams, "Invalid params"}
 	}
 
-	tool, ok := tools[p.Name]
+	tool, ok := findTool(p.Name)
 	if !ok {
 		return nil, &rpcError{codeInvalidParams, "Unknown tool: " + p.Name}
 	}
 
-	text, err := tool.run(ctx, s, p.Arguments)
+	// Every tool requires at least its role; tools apply the document access
+	// rules to their own arguments
+	var texts []string
+	err := requireRole(SessionFromContext(ctx), tool.role)
+	if err == nil {
+		texts, err = tool.run(ctx, s, p.Arguments)
+	}
 	var toolErr *toolError
 	switch {
 	case errors.As(err, &toolErr):
 		// Failures the agent can act on are tool results, not protocol errors
-		return toolResult(toolErr.message, true), nil
+		return toolResult([]string{toolErr.message}, true), nil
 	case err != nil:
 		logger.Error("MCP tool %s failed: %v", p.Name, err)
 		return nil, &rpcError{codeInternalError, "Internal error"}
 	}
-	return toolResult(text, false), nil
+	return toolResult(texts, false), nil
 }
 
-func toolResult(text string, isError bool) map[string]interface{} {
-	result := map[string]interface{}{
-		"content": []map[string]interface{}{{"type": "text", "text": text}},
+func toolResult(texts []string, isError bool) map[string]interface{} {
+	content := make([]map[string]interface{}, 0, len(texts))
+	for _, text := range texts {
+		content = append(content, map[string]interface{}{"type": "text", "text": text})
 	}
+	result := map[string]interface{}{"content": content}
 	if isError {
 		result["isError"] = true
 	}

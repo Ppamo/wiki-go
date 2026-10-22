@@ -344,13 +344,34 @@ paths:
 
         The caller is authenticated on every request with the same resolver as
         the rest of the API; agents normally send a personal access token as
-        `Authorization: Bearer wgo_pat_...`. Each tool applies the role
-        hierarchy and the document access rules to its own arguments.
+        `Authorization: Bearer wgo_pat_...`. Every tool has a minimum role:
+        `tools/list` only returns the tools the caller's role (capped by the
+        token's `role`) may call, and calling another one returns a tool result
+        with `isError: true`. Tools apply the document access rules to their
+        own arguments and results. `initialize` returns `instructions` that
+        describe the workflow.
 
-        Tools:
-        - `read_document` (viewer, read-only): `{"path": "guides/intro"}` returns
-          the Markdown source. Missing and forbidden documents both return a tool
-          result with `isError: true` and the same message.
+        Document paths use `"guides/intro"` (leading and trailing slashes are
+        ignored); `""` or `"/"` is the home page.
+
+        Tools (all read-only, minimum role `viewer`):
+        - `search_documents`: `{"query": "deploy not draft", "limit": 10}`
+          runs the full-text search of `/api/search` and returns the path, title
+          and excerpt of up to `limit` matches (default 10, max 50). An empty
+          query is rejected.
+        - `list_documents`: `{"prefix": "guides", "depth": 2}` lists
+          `path — title` lines in tree order, including the home page when
+          `prefix` is empty. `depth` limits the levels below the prefix
+          (default 2, `0` for all); deeper documents are counted on their
+          ancestor as `+N below`. Results are capped at 500 entries.
+        - `read_document`: `{"path": "guides/intro", "include": ["comments"]}`
+          returns two text blocks: metadata (`path`, `revision`, a hash of the
+          current content, and the `include` sections `attachments`, `history`
+          and `comments`), then the Markdown source. `version` (a
+          `yyyymmddhhmmss` timestamp) reads an old version instead and omits
+          `revision`. `version` and the `history` section require `editor`,
+          like `/api/versions`. Missing and forbidden documents both return a
+          tool result with `isError: true` and the same message.
 
         Requests with an `Origin` header that does not match the host get `403`.
         An unsupported `MCP-Protocol-Version` header gets `400`.
@@ -1056,7 +1077,7 @@ paths:
       summary: Full-text search in documents
       description: |
         Query syntax: words are ANDed, `"exact phrase"` matches a phrase and
-        `-word` excludes a word. Only documents the caller can access are
+        `not word` excludes a word. Only documents the caller can access are
         returned. When nothing matches the body is `null`. Errors are plain text.
       x-required-role: none
       security:
@@ -1072,7 +1093,7 @@ paths:
               properties:
                 query:
                   type: string
-                  example: 'report "quarterly results" -draft'
+                  example: 'report "quarterly results" not draft'
       responses:
         "200":
           description: Matching documents.

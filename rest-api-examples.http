@@ -66,12 +66,26 @@ Content-Type: application/json
 
 {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
 
-#### MCP: read a document
+#### MCP: search documents
 POST {{ base_url }}/mcp
 Authorization: Bearer {{ createToken.response.body.token }}
 Content-Type: application/json
 
-{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "read_document", "arguments": {"path": "{{ doc_path }}"}}}
+{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "search_documents", "arguments": {"query": "API Test", "limit": 5}}}
+
+#### MCP: list documents two levels deep
+POST {{ base_url }}/mcp
+Authorization: Bearer {{ createToken.response.body.token }}
+Content-Type: application/json
+
+{"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "list_documents", "arguments": {"prefix": "", "depth": 2}}}
+
+#### MCP: read a document with its attachments and comments
+POST {{ base_url }}/mcp
+Authorization: Bearer {{ createToken.response.body.token }}
+Content-Type: application/json
+
+{"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "read_document", "arguments": {"path": "{{ doc_path }}", "include": ["attachments", "comments"]}}}
 
 #### Manage tokens with a token (expect 403)
 GET {{ base_url }}/api/tokens

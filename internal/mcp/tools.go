@@ -1,15 +1,11 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"os"
-	"path/filepath"
-	"strings"
 	"wiki-go/internal/auth"
-	"wiki-go/internal/logger"
 	"wiki-go/internal/roles"
-	"wiki-go/internal/utils"
 )
 
 // toolError is a failure reported to the agent as a tool result with isError,
@@ -21,40 +17,56 @@ type toolError struct {
 func (e *toolError) Error() string { return e.message }
 
 type tool struct {
-	definition map[string]interface{}
-	run        func(ctx context.Context, s *Server, arguments json.RawMessage) (string, error)
+	name        string
+	title       string
+	description string
+	inputSchema map[string]interface{}
+	annotations map[string]interface{}
+	// role is the minimum role that sees the tool in tools/list and may call it
+	role string
+	// run returns the text blocks of the result, in order
+	run func(ctx context.Context, s *Server, arguments json.RawMessage) ([]string, error)
 }
 
-var tools = map[string]tool{
-	"read_document": {
-		definition: map[string]interface{}{
-			"name":  "read_document",
-			"title": "Read document",
-			"description": "Returns the Markdown source of a wiki document. " +
-				"The path is the document URL path without a leading slash, " +
-				"for example \"finance/finance-report\"; use \"\" or \"/\" for the home page.",
-			"inputSchema": map[string]interface{}{
-				"type": "object",
-				"properties": map[string]interface{}{
-					"path": map[string]interface{}{
-						"type":        "string",
-						"description": "Document path, e.g. \"finance/finance-report\"",
-					},
-				},
-				"required": []string{"path"},
-			},
-			"annotations": map[string]interface{}{
-				"readOnlyHint": true,
-			},
-		},
-		run: readDocument,
-	},
+func (t tool) definition() map[string]interface{} {
+	return map[string]interface{}{
+		"name":        t.name,
+		"title":       t.title,
+		"description": t.description,
+		"inputSchema": t.inputSchema,
+		"annotations": t.annotations,
+	}
 }
 
-func toolDefinitions() []map[string]interface{} {
-	definitions := make([]map[string]interface{}, 0, len(tools))
-	for _, t := range tools {
-		definitions = append(definitions, t.definition)
+// readOnlyAnnotations marks tools that only read the wiki.
+var readOnlyAnnotations = map[string]interface{}{
+	"readOnlyHint":  true,
+	"openWorldHint": false,
+}
+
+// registry lists the tools in the order tools/list returns them.
+var registry = []tool{
+	searchDocumentsTool,
+	listDocumentsTool,
+	readDocumentTool,
+}
+
+func findTool(name string) (tool, bool) {
+	for _, t := range registry {
+		if t.name == name {
+			return t, true
+		}
+	}
+	return tool{}, false
+}
+
+// toolDefinitions returns the tools the session's role may call.
+func toolDefinitions(session *auth.Session) []map[string]interface{} {
+	definitions := []map[string]interface{}{}
+	for _, t := range registry {
+		if requireRole(session, t.role) == nil {
+			definitions = append(definitions, t.definition())
+		}
 	}
 	return definitions
 }
@@ -67,51 +79,14 @@ func requireRole(session *auth.Session, role string) error {
 	return nil
 }
 
-// errDocumentUnavailable hides whether a restricted document exists.
-var errDocumentUnavailable = &toolError{"Document not found or access denied"}
-
-func readDocument(ctx context.Context, s *Server, arguments json.RawMessage) (string, error) {
-	var args struct {
-		Path string `json:"path"`
+// decodeArguments unmarshals the tool arguments into args. Missing arguments
+// leave args at its zero value.
+func decodeArguments(arguments json.RawMessage, args interface{}) error {
+	if len(bytes.TrimSpace(arguments)) == 0 || bytes.Equal(bytes.TrimSpace(arguments), []byte("null")) {
+		return nil
 	}
-	if err := json.Unmarshal(arguments, &args); err != nil {
-		return "", &toolError{"Invalid arguments: path must be a string"}
+	if err := json.Unmarshal(arguments, args); err != nil {
+		return &toolError{"Invalid arguments: " + err.Error()}
 	}
-
-	session := SessionFromContext(ctx)
-	if err := requireRole(session, roles.RoleViewer); err != nil {
-		return "", err
-	}
-
-	// Resolve the document like the API does: home page first, otherwise a
-	// contained path below the documents root.
-	logicalPath := "/"
-	var docFile string
-	requestPath := strings.Trim(args.Path, "/")
-	if requestPath == "" {
-		docFile = filepath.Join(s.cfg.Wiki.RootDir, "pages", "home", "document.md")
-	} else {
-		resolved, err := utils.ResolveRelativeDocumentPath(s.cfg.Wiki.RootDir, s.cfg.Wiki.DocumentsDir, requestPath)
-		if err != nil {
-			return "", &toolError{"Invalid document path"}
-		}
-		logicalPath = resolved.LogicalPath
-		docFile = filepath.Join(resolved.FilesystemPath, "document.md")
-	}
-
-	// Access rules apply to the document path, not to the /mcp request path
-	if !auth.CanAccessDocument(logicalPath, session, s.cfg) {
-		return "", errDocumentUnavailable
-	}
-
-	content, err := os.ReadFile(docFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", errDocumentUnavailable
-		}
-		return "", err
-	}
-
-	logger.Debug("MCP read_document %s by %s (token %q)", logicalPath, session.Username, session.TokenName)
-	return string(content), nil
+	return nil
 }

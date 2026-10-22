@@ -83,6 +83,7 @@ type rpcResult struct {
 	Result struct {
 		ProtocolVersion string                 `json:"protocolVersion"`
 		Capabilities    map[string]interface{} `json:"capabilities"`
+		Instructions    string                 `json:"instructions"`
 		Tools           []struct {
 			Name string `json:"name"`
 		} `json:"tools"`
@@ -107,9 +108,21 @@ func decodeRPC(t *testing.T, response *httptest.ResponseRecorder) rpcResult {
 	return result
 }
 
+func toolCall(name string, arguments interface{}) string {
+	encoded, _ := json.Marshal(arguments)
+	return `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"` + name + `","arguments":` + string(encoded) + `}}`
+}
+
 func readDocumentCall(path string) string {
-	arguments, _ := json.Marshal(map[string]string{"path": path})
-	return `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read_document","arguments":` + string(arguments) + `}}`
+	return toolCall("read_document", map[string]string{"path": path})
+}
+
+// documentText returns the Markdown block of a read_document result.
+func documentText(result rpcResult) string {
+	if len(result.Result.Content) != 2 {
+		return ""
+	}
+	return result.Result.Content[1].Text
 }
 
 func TestMCPRequiresAuthentication(t *testing.T) {
@@ -157,7 +170,7 @@ func TestMCPAcceptsLoginSessionCookie(t *testing.T) {
 	wiki.server.ServeHTTP(response, request)
 
 	result := decodeRPC(t, response)
-	if result.Result.IsError || len(result.Result.Content) != 1 || result.Result.Content[0].Text != "# Intro" {
+	if result.Result.IsError || documentText(result) != "# Intro" {
 		t.Fatalf("result = %+v, want the intro document", result.Result)
 	}
 }
@@ -194,6 +207,9 @@ func TestMCPProtocolLifecycle(t *testing.T) {
 	if _, ok := initialize.Result.Capabilities["tools"]; !ok {
 		t.Fatalf("capabilities = %+v, want tools", initialize.Result.Capabilities)
 	}
+	if !strings.Contains(initialize.Result.Instructions, "search_documents") {
+		t.Fatalf("instructions = %q, want the tool workflow", initialize.Result.Instructions)
+	}
 
 	unknownVersion := decodeRPC(t, wiki.post(t, wiki.viewerToken,
 		`{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}`))
@@ -206,8 +222,12 @@ func TestMCPProtocolLifecycle(t *testing.T) {
 	}
 
 	list := decodeRPC(t, wiki.post(t, wiki.viewerToken, `{"jsonrpc":"2.0","id":3,"method":"tools/list"}`))
-	if len(list.Result.Tools) != 1 || list.Result.Tools[0].Name != "read_document" {
-		t.Fatalf("tools = %+v, want read_document", list.Result.Tools)
+	var names []string
+	for _, tool := range list.Result.Tools {
+		names = append(names, tool.Name)
+	}
+	if strings.Join(names, ",") != "search_documents,list_documents,read_document" {
+		t.Fatalf("tools = %v, want the read-only tools in registry order", names)
 	}
 
 	unknown := decodeRPC(t, wiki.post(t, wiki.viewerToken, `{"jsonrpc":"2.0","id":4,"method":"resources/list"}`))
@@ -268,20 +288,38 @@ func TestReadDocumentAppliesAccessRules(t *testing.T) {
 			if result.Error != nil {
 				t.Fatalf("protocol error = %+v, want a tool result", result.Error)
 			}
-			if result.Result.IsError != test.isError || len(result.Result.Content) != 1 || result.Result.Content[0].Text != test.want {
-				t.Fatalf("result = %+v, want text %q with isError=%t", result.Result, test.want, test.isError)
+			if result.Result.IsError != test.isError {
+				t.Fatalf("result = %+v, want isError=%t", result.Result, test.isError)
+			}
+			if test.isError && (len(result.Result.Content) != 1 || result.Result.Content[0].Text != test.want) {
+				t.Fatalf("result = %+v, want error %q", result.Result, test.want)
+			}
+			if !test.isError && documentText(result) != test.want {
+				t.Fatalf("result = %+v, want document %q", result.Result, test.want)
 			}
 		})
 	}
 }
 
-func TestReadDocumentRequiresAKnownRole(t *testing.T) {
+func TestToolsRequireAKnownRole(t *testing.T) {
 	wiki := newTestWiki(t)
 	wiki.cfg.Users[0].Role = ""
 	auth.SetConfig(wiki.cfg)
 
-	result := decodeRPC(t, wiki.post(t, wiki.viewerToken, readDocumentCall("guides/intro")))
-	if !result.Result.IsError || !strings.Contains(result.Result.Content[0].Text, "Insufficient role") {
-		t.Fatalf("result = %+v, want an insufficient role error", result.Result)
+	list := decodeRPC(t, wiki.post(t, wiki.viewerToken, `{"jsonrpc":"2.0","id":3,"method":"tools/list"}`))
+	if list.Error != nil || len(list.Result.Tools) != 0 {
+		t.Fatalf("tools/list = %+v, want no tools for an unknown role", list)
+	}
+
+	calls := []string{
+		readDocumentCall("guides/intro"),
+		toolCall("search_documents", map[string]string{"query": "intro"}),
+		toolCall("list_documents", map[string]string{}),
+	}
+	for _, call := range calls {
+		result := decodeRPC(t, wiki.post(t, wiki.viewerToken, call))
+		if !result.Result.IsError || !strings.Contains(result.Result.Content[0].Text, "Insufficient role") {
+			t.Fatalf("result = %+v, want an insufficient role error", result.Result)
+		}
 	}
 }
