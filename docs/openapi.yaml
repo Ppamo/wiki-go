@@ -67,6 +67,8 @@ tags:
     description: Import documents from a ZIP archive (admin)
   - name: Backup
     description: Backups of the data directory (admin)
+  - name: MCP
+    description: Model Context Protocol endpoint for agents
   - name: Pages
     description: HTML pages, sitemaps and static assets (non-JSON)
 
@@ -327,6 +329,87 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/ServerError"
+
+  # ----------------------------------------------------------------- MCP
+  /mcp:
+    post:
+      tags: [MCP]
+      operationId: mcp
+      summary: Model Context Protocol endpoint (Streamable HTTP)
+      description: |
+        Receives one JSON-RPC 2.0 message per request and answers with a single
+        `application/json` response (stateless; no SSE stream and no
+        `Mcp-Session-Id`). Supported methods: `initialize`, `ping`, `tools/list`
+        and `tools/call`. Notifications get `202` with no body.
+
+        The caller is authenticated on every request with the same resolver as
+        the rest of the API; agents normally send a personal access token as
+        `Authorization: Bearer wgo_pat_...`. Each tool applies the role
+        hierarchy and the document access rules to its own arguments.
+
+        Tools:
+        - `read_document` (viewer, read-only): `{"path": "guides/intro"}` returns
+          the Markdown source. Missing and forbidden documents both return a tool
+          result with `isError: true` and the same message.
+
+        Requests with an `Origin` header that does not match the host get `403`.
+        An unsupported `MCP-Protocol-Version` header gets `400`.
+      x-required-role: viewer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [jsonrpc, method]
+              properties:
+                jsonrpc:
+                  type: string
+                  const: "2.0"
+                id:
+                  type: [string, integer]
+                method:
+                  type: string
+                  example: tools/call
+                params:
+                  type: object
+            example:
+              jsonrpc: "2.0"
+              id: 1
+              method: tools/call
+              params:
+                name: read_document
+                arguments:
+                  path: guides/intro
+      responses:
+        "200":
+          description: JSON-RPC response with `result` or `error`.
+          content:
+            application/json:
+              schema:
+                type: object
+        "202":
+          description: Notification accepted.
+        "400":
+          description: Unsupported `MCP-Protocol-Version` header.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "401":
+          description: "No valid credential; includes a `WWW-Authenticate: Bearer` challenge."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "403":
+          description: Cross-origin request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
 
   # ----------------------------------------------------------- Documents
   /api/document/create:

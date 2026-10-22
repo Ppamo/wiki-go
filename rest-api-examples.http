@@ -52,6 +52,27 @@ GET {{ base_url }}/api/check-auth
 Authorization: Bearer {{ createToken.response.body.token }}
 Accept: application/json
 
+#### MCP: initialize with the token
+POST {{ base_url }}/mcp
+Authorization: Bearer {{ createToken.response.body.token }}
+Content-Type: application/json
+
+{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}
+
+#### MCP: list tools
+POST {{ base_url }}/mcp
+Authorization: Bearer {{ createToken.response.body.token }}
+Content-Type: application/json
+
+{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+
+#### MCP: read a document
+POST {{ base_url }}/mcp
+Authorization: Bearer {{ createToken.response.body.token }}
+Content-Type: application/json
+
+{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "read_document", "arguments": {"path": "{{ doc_path }}"}}}
+
 #### Manage tokens with a token (expect 403)
 GET {{ base_url }}/api/tokens
 Authorization: Bearer {{ createToken.response.body.token }}
