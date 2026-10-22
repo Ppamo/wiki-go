@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"wiki-go/internal/crypto"
 	"wiki-go/internal/roles"
 
@@ -20,10 +21,26 @@ var (
 
 // User represents a user with authentication credentials
 type User struct {
-	Username string   `yaml:"username" json:"username"`
-	Password string   `yaml:"password" json:"password,omitempty"`
-	Role     string   `yaml:"role" json:"role"`                         // "admin", "editor", or "viewer"
-	Groups   []string `yaml:"groups,omitempty" json:"groups,omitempty"` // Optional groups for access control
+	Username string     `yaml:"username" json:"username"`
+	Password string     `yaml:"password" json:"password,omitempty"`
+	Role     string     `yaml:"role" json:"role"`                         // "admin", "editor", or "viewer"
+	Groups   []string   `yaml:"groups,omitempty" json:"groups,omitempty"` // Optional groups for access control
+	Tokens   []APIToken `yaml:"tokens,omitempty" json:"-"`                // Personal access tokens for API and MCP clients
+}
+
+// APIToken is a personal access token owned by a user. Only the SHA-256 hash
+// of the token is stored; the plain value is shown once when it is created.
+type APIToken struct {
+	Name      string    `yaml:"name" json:"name"`
+	Hash      string    `yaml:"hash" json:"-"`
+	Role      string    `yaml:"role,omitempty" json:"role,omitempty"` // Optional cap; empty means the owner's role
+	CreatedAt time.Time `yaml:"created_at" json:"created_at"`
+	ExpiresAt time.Time `yaml:"expires_at,omitempty" json:"expires_at,omitempty"` // Zero means no expiry
+}
+
+// IsExpired reports whether the token has an expiry date in the past.
+func (t APIToken) IsExpired(now time.Time) bool {
+	return !t.ExpiresAt.IsZero() && now.After(t.ExpiresAt)
 }
 
 // AccessRule defines a path-based access control rule
@@ -309,6 +326,20 @@ func FormatUserEntry(user User) string {
 		entry += "\n      groups:"
 		for _, group := range user.Groups {
 			entry += fmt.Sprintf("\n        - %s", group)
+		}
+	}
+	if len(user.Tokens) > 0 {
+		entry += "\n      tokens:"
+		for _, token := range user.Tokens {
+			entry += fmt.Sprintf("\n        - name: %s\n          hash: %s",
+				formatYAMLStringList([]string{token.Name}), token.Hash)
+			if token.Role != "" {
+				entry += fmt.Sprintf("\n          role: %s", token.Role)
+			}
+			entry += fmt.Sprintf("\n          created_at: %s", token.CreatedAt.UTC().Format(time.RFC3339))
+			if !token.ExpiresAt.IsZero() {
+				entry += fmt.Sprintf("\n          expires_at: %s", token.ExpiresAt.UTC().Format(time.RFC3339))
+			}
 		}
 	}
 	return entry

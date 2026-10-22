@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 	"wiki-go/internal/config"
@@ -22,6 +23,14 @@ type Session struct {
 	CreatedAt    time.Time `json:"created_at"`
 	ExpiresAt    time.Time `json:"expires_at"`
 	LastAccessed time.Time `json:"last_accessed"`
+	// TokenName is set when the request was authenticated with a personal
+	// access token instead of a login session. Such sessions are never stored.
+	TokenName string `json:"token_name,omitempty"`
+}
+
+// IsPersonalToken reports whether the session comes from a personal access token.
+func (s *Session) IsPersonalToken() bool {
+	return s.TokenName != ""
 }
 
 var (
@@ -160,17 +169,46 @@ func CreateSession(w http.ResponseWriter, username string, role string, groups [
 	return nil
 }
 
-// GetSession retrieves the session for the current request
+// GetSession retrieves the session for the current request. It is the single
+// credential resolver used by every handler: the session_token cookie is tried
+// first, then an "Authorization: Bearer" header carrying either a session token
+// or a personal access token.
 func GetSession(r *http.Request) *Session {
-	c, err := r.Cookie("session_token")
-	if err != nil {
-		return nil
+	if c, err := r.Cookie("session_token"); err == nil {
+		if session := lookupSession(c.Value); session != nil {
+			return session
+		}
 	}
 
+	token := bearerToken(r)
+	if token == "" {
+		return nil
+	}
+	if strings.HasPrefix(token, PersonalTokenPrefix) {
+		return lookupPersonalToken(token)
+	}
+	return lookupSession(token)
+}
+
+// requestSessionToken returns the login session token sent with the request,
+// from the cookie or from a bearer header. Personal access tokens are ignored.
+func requestSessionToken(r *http.Request) string {
+	if c, err := r.Cookie("session_token"); err == nil && c.Value != "" {
+		return c.Value
+	}
+	if token := bearerToken(r); !strings.HasPrefix(token, PersonalTokenPrefix) {
+		return token
+	}
+	return ""
+}
+
+// lookupSession returns the stored session for a session token, removing it
+// when it has expired.
+func lookupSession(token string) *Session {
 	mu.Lock()
 	defer mu.Unlock()
 
-	hashedToken := hashToken(c.Value)
+	hashedToken := hashToken(token)
 	session, exists := sessions[hashedToken]
 	if !exists {
 		return nil
@@ -247,9 +285,8 @@ func ClearSessionCookies(w http.ResponseWriter, cfg *config.Config) {
 
 // ClearSession removes the session from the sessions map and clears the cookie
 func ClearSession(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
-	c, err := r.Cookie("session_token")
-	if err == nil {
-		hashedToken := hashToken(c.Value)
+	if token := requestSessionToken(r); token != "" {
+		hashedToken := hashToken(token)
 
 		mu.Lock()
 		if _, exists := sessions[hashedToken]; exists {

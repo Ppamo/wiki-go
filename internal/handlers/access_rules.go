@@ -74,6 +74,9 @@ func GetAccessRulesHandler(w http.ResponseWriter, r *http.Request) {
 
 // CreateAccessRuleHandler creates a new access rule
 func CreateAccessRuleHandler(w http.ResponseWriter, r *http.Request) {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+
 	var rule config.AccessRule
 	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
 		sendJSONError(w, "Invalid request payload", http.StatusBadRequest, err.Error())
@@ -106,7 +109,7 @@ func CreateAccessRuleHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update global config
-	*cfg = updatedConfig
+	publishConfig(updatedConfig)
 
 	session := auth.GetSession(r)
 	admin := ""
@@ -126,6 +129,9 @@ func CreateAccessRuleHandler(w http.ResponseWriter, r *http.Request) {
 
 // UpdateAccessRuleHandler updates an existing access rule
 func UpdateAccessRuleHandler(w http.ResponseWriter, r *http.Request, index int) {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+
 	if index < 0 || index >= len(cfg.AccessRules) {
 		sendJSONError(w, "Rule not found", http.StatusNotFound, "")
 		return
@@ -163,7 +169,7 @@ func UpdateAccessRuleHandler(w http.ResponseWriter, r *http.Request, index int) 
 	}
 
 	// Update global config
-	*cfg = updatedConfig
+	publishConfig(updatedConfig)
 
 	session := auth.GetSession(r)
 	admin := ""
@@ -182,6 +188,9 @@ func UpdateAccessRuleHandler(w http.ResponseWriter, r *http.Request, index int) 
 
 // DeleteAccessRuleHandler deletes an access rule
 func DeleteAccessRuleHandler(w http.ResponseWriter, r *http.Request, index int) {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+
 	if index < 0 || index >= len(cfg.AccessRules) {
 		sendJSONError(w, "Rule not found", http.StatusNotFound, "")
 		return
@@ -200,7 +209,7 @@ func DeleteAccessRuleHandler(w http.ResponseWriter, r *http.Request, index int) 
 	}
 
 	// Update global config
-	*cfg = updatedConfig
+	publishConfig(updatedConfig)
 
 	session := auth.GetSession(r)
 	admin := ""
@@ -218,6 +227,9 @@ func DeleteAccessRuleHandler(w http.ResponseWriter, r *http.Request, index int) 
 
 // ReorderAccessRulesHandler reorders the access rules
 func ReorderAccessRulesHandler(w http.ResponseWriter, r *http.Request) {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+
 	var req struct {
 		Indices []int `json:"indices"`
 	}
@@ -254,7 +266,7 @@ func ReorderAccessRulesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update global config
-	*cfg = updatedConfig
+	publishConfig(updatedConfig)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{

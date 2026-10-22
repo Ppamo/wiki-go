@@ -9,6 +9,7 @@ import (
 	"wiki-go/internal/config"
 	"wiki-go/internal/crypto"
 	"wiki-go/internal/logger"
+	"wiki-go/internal/roles"
 )
 
 // User represents a user in the response
@@ -104,6 +105,9 @@ func CreateUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+
 	// Parse the request body
 	var req UserCreateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -159,7 +163,7 @@ func CreateUserHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update the global config
-	*cfg = updatedConfig
+	publishConfig(updatedConfig)
 
 	logger.Info("Admin %s created user %s with role %s", session.Username, req.Username, req.Role)
 
@@ -180,6 +184,9 @@ func UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 		sendJSONError(w, "Unauthorized", http.StatusUnauthorized, "")
 		return
 	}
+
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
 
 	// Parse the request body
 	var req UserUpdateRequest
@@ -209,7 +216,7 @@ func UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 	revokeSessions := false
 	for i, user := range updatedConfig.Users {
 		if user.Username == req.Username {
-			revokeSessions = roleRank(req.Role) < roleRank(user.Role) ||
+			revokeSessions = roles.Rank(req.Role) < roles.Rank(user.Role) ||
 				req.NewPassword != "" || !slices.Equal(req.Groups, user.Groups)
 			// Update the user's role
 			updatedConfig.Users[i].Role = req.Role
@@ -223,6 +230,8 @@ func UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				updatedConfig.Users[i].Password = hashedPassword
+				// A password reset also revokes the user's personal access tokens
+				updatedConfig.Users[i].Tokens = nil
 			}
 
 			userFound = true
@@ -252,7 +261,7 @@ func UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update the global config
-	*cfg = updatedConfig
+	publishConfig(updatedConfig)
 
 	logger.Info("Admin %s updated user %s: role=%s", session.Username, req.Username, req.Role)
 
@@ -266,19 +275,6 @@ func UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func roleRank(role string) int {
-	switch role {
-	case config.RoleAdmin:
-		return 3
-	case config.RoleEditor:
-		return 2
-	case config.RoleViewer:
-		return 1
-	default:
-		return 0
-	}
-}
-
 // DeleteUserHandler deletes a user
 func DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 	// Check if user is authenticated and has admin role
@@ -287,6 +283,9 @@ func DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 		sendJSONError(w, "Unauthorized", http.StatusUnauthorized, "")
 		return
 	}
+
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
 
 	// Get username from query parameters
 	username := r.URL.Query().Get("username")
@@ -346,7 +345,7 @@ func DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update the global config
-	*cfg = updatedConfig
+	publishConfig(updatedConfig)
 
 	logger.Info("Admin %s deleted user %s", session.Username, username)
 
@@ -381,6 +380,9 @@ func PasswordHandler(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
 
 	// Parse the request body
 	var req UserUpdatePasswordRequest
@@ -421,8 +423,9 @@ func PasswordHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// Update password
+			// Update password and revoke personal access tokens
 			updatedConfig.Users[i].Password = hashedNewPassword
+			updatedConfig.Users[i].Tokens = nil
 
 			userFound = true
 			break
@@ -447,7 +450,7 @@ func PasswordHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update the global config
-	*cfg = updatedConfig
+	publishConfig(updatedConfig)
 
 	// Send success response
 	w.WriteHeader(http.StatusOK)

@@ -107,6 +107,9 @@ func UpdateWikiSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+
 	// Parse the request body
 	var req WikiSettingsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -165,7 +168,7 @@ func UpdateWikiSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update the global config
-	*cfg = updatedConfig
+	publishConfig(updatedConfig)
 
 	// Apply updated timezone to shortcode rendering so :::stats recent:::
 	// reflects the new setting without requiring a restart.

@@ -30,6 +30,35 @@ Content-Type: application/json
 GET {{ base_url }}/api/check-auth
 Accept: application/json
 
+### Personal access tokens
+
+#### Create a token for an MCP client (shown only once)
+# @name createToken
+POST {{ base_url }}/api/tokens
+Content-Type: application/json
+
+{
+  "name": "mcp-agent",
+  "role": "viewer",
+  "expires_in_days": 30
+}
+
+#### List tokens
+GET {{ base_url }}/api/tokens
+Accept: application/json
+
+#### Check auth with the token instead of the cookie
+GET {{ base_url }}/api/check-auth
+Authorization: Bearer {{ createToken.response.body.token }}
+Accept: application/json
+
+#### Manage tokens with a token (expect 403)
+GET {{ base_url }}/api/tokens
+Authorization: Bearer {{ createToken.response.body.token }}
+
+#### Revoke the token
+DELETE {{ base_url }}/api/tokens?name=mcp-agent
+
 ### Profile
 
 #### Change password (wrong current password — expect 401)

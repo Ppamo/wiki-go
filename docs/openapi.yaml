@@ -5,10 +5,18 @@ info:
   description: |
     HTTP API exposed by Wiki-Go (`internal/routes/routes.go`).
 
-    **Authentication.** Every endpoint uses the cookie-based session created by
-    `POST /api/login`. The server sets two cookies: `session_token` (HTTP-only,
-    the actual credential) and `session_user` (readable by JavaScript, informational
-    only). Send `session_token` on every request that needs a user.
+    **Authentication.** Every endpoint resolves the caller with the same
+    credential resolver, which accepts, in this order:
+
+    1. The `session_token` cookie created by `POST /api/login`. The server sets
+       two cookies: `session_token` (HTTP-only, the actual credential) and
+       `session_user` (readable by JavaScript, informational only).
+    2. An `Authorization: Bearer <token>` header carrying either a session token
+       or a personal access token (prefix `wgo_pat_`, see `/api/tokens`).
+
+    Personal access tokens are meant for API and MCP clients. They act as their
+    owner with the owner's current role and groups, capped by the token's
+    optional `role`. They are revoked when the owner's password changes.
 
     **Roles.** Users have one of three roles: `admin` > `editor` > `viewer`.
     The minimum role for each operation is given in its description and in the
@@ -64,6 +72,7 @@ tags:
 
 security:
   - sessionCookie: []
+  - bearerToken: []
 
 paths:
   # ---------------------------------------------------------------- Auth
@@ -179,8 +188,8 @@ paths:
       operationId: changeOwnPassword
       summary: Change the current user's password
       description: |
-        On success all sessions of the user are revoked and the session cookies
-        are cleared, so the client must log in again.
+        On success all sessions and personal access tokens of the user are
+        revoked and the session cookies are cleared, so the client must log in again.
       x-required-role: viewer
       requestBody:
         required: true
@@ -216,6 +225,106 @@ paths:
           $ref: "#/components/responses/NotFound"
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/tokens:
+    get:
+      tags: [Auth]
+      operationId: listTokens
+      summary: List the current user's personal access tokens
+      description: |
+        Returns the tokens without their secret. Requests authenticated with a
+        personal access token get `403`: tokens can only be managed from a login session.
+      x-required-role: viewer
+      responses:
+        "200":
+          description: The user's tokens.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  tokens:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TokenInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Auth]
+      operationId: createToken
+      summary: Create a personal access token
+      description: |
+        The plain token is returned only in this response; the server stores
+        only its SHA-256 hash in `config.yaml`. A user can hold up to 20 tokens.
+      x-required-role: viewer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenCreateRequest"
+      responses:
+        "201":
+          description: Token created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/GenericResponse"
+                  - type: object
+                    properties:
+                      token:
+                        type: string
+                        example: wgo_pat_Zm9vYmFy...
+                      details:
+                        $ref: "#/components/schemas/TokenInfo"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: |
+            The request used a personal access token, or `role` is above the user's role.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "409":
+          description: A token with that name exists, or the user has 20 tokens.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    delete:
+      tags: [Auth]
+      operationId: deleteToken
+      summary: Revoke a personal access token
+      x-required-role: viewer
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          $ref: "#/components/responses/Success"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/ServerError"
 
@@ -1827,6 +1936,12 @@ components:
       in: cookie
       name: session_token
       description: Session token set by `POST /api/login`.
+    bearerToken:
+      type: http
+      scheme: bearer
+      description: |
+        A session token, or a personal access token created with
+        `POST /api/tokens` (prefix `wgo_pat_`).
 
   parameters:
     DocPath:
@@ -2386,6 +2501,41 @@ components:
           type: array
           items:
             type: string
+    TokenInfo:
+      type: object
+      required: [name, created_at, expired]
+      properties:
+        name:
+          type: string
+        role:
+          description: Role cap; absent means the owner's role.
+          $ref: "#/components/schemas/Role"
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          description: Absent when the token does not expire.
+        expired:
+          type: boolean
+    TokenCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+          description: Unique per user.
+        role:
+          description: Optional cap, at most the user's own role.
+          $ref: "#/components/schemas/Role"
+        expires_in_days:
+          type: integer
+          minimum: 0
+          maximum: 3650
+          default: 0
+          description: "`0` means the token does not expire."
     UserCreateRequest:
       type: object
       required: [username, password]
