@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 	"wiki-go/internal/auth"
 	"wiki-go/internal/config"
+	"wiki-go/internal/documents"
 	"wiki-go/internal/logger"
 	"wiki-go/internal/utils"
 )
@@ -253,22 +253,11 @@ func handleVersionRestore(w http.ResponseWriter, r *http.Request, cfg *config.Co
 	logger.Debug("Restore request: docPath=%s, timestamp=%s", docPath, timestamp)
 
 	versionFilePath := filepath.Join(resolved.versionsDir, timestamp+".md")
-	documentPath := filepath.Join(resolved.documentDir, "document.md")
-
 	logger.Debug("Version file path: %s", versionFilePath)
-	logger.Debug("Document path for restore: %s", documentPath)
 
 	// Check if version file exists
 	if _, err := os.Stat(versionFilePath); os.IsNotExist(err) {
 		sendJSONErrorVersion(w, "Version not found", http.StatusNotFound)
-		return
-	}
-
-	// Ensure the document directory exists
-	docDir := filepath.Dir(documentPath)
-	if err := os.MkdirAll(docDir, 0755); err != nil {
-		logger.Error("Error creating directory: %v", err)
-		sendJSONErrorVersion(w, "Failed to ensure document directory exists", http.StatusInternalServerError)
 		return
 	}
 
@@ -280,40 +269,17 @@ func handleVersionRestore(w http.ResponseWriter, r *http.Request, cfg *config.Co
 		return
 	}
 
-	// Before overwriting current document, save it as a version
-	if _, err := os.Stat(documentPath); err == nil && cfg.Wiki.MaxVersions > 0 {
-		// Document exists, read its current content
-		currentContent, err := os.ReadFile(documentPath)
-		if err == nil && len(currentContent) > 0 {
-			// Create timestamp for version filename
-			newTimestamp := time.Now().Format("20060102150405") // Format: yyyymmddhhmmss
-
-			// Ensure versions directory exists
-			if err := os.MkdirAll(resolved.versionsDir, 0755); err == nil {
-				// Create version file path with timestamp
-				newVersionPath := filepath.Join(resolved.versionsDir, newTimestamp+".md")
-
-				// Save the current content as a version
-				_ = os.WriteFile(newVersionPath, currentContent, 0644) // Ignore error for now
-
-				// Clean up old versions if needed
-				utils.CleanupOldVersions(resolved.versionsDir, cfg.Wiki.MaxVersions)
-			}
-		}
+	// The write path of /api/save keeps the current content as a version,
+	// skips identical content and writes atomically
+	doc := documents.Document{
+		LogicalPath: resolved.logicalPath,
+		Dir:         resolved.documentDir,
+		VersionsDir: resolved.versionsDir,
 	}
-
-	// Write the version content to the document file
-	if err := os.WriteFile(documentPath, versionContent, 0644); err != nil {
+	if _, err := documents.Save(cfg, doc, versionContent, documents.SaveOptions{}); err != nil {
 		logger.Error("Error writing to document file: %v", err)
 		sendJSONErrorVersion(w, "Failed to restore document", http.StatusInternalServerError)
 		return
-	}
-
-	// Force update the file's modification time to ensure cache invalidation
-	now := time.Now()
-	if err := os.Chtimes(documentPath, now, now); err != nil {
-		logger.Warn("Couldn't update file timestamp: %v", err)
-		// Continue anyway, not critical
 	}
 
 	session := auth.GetSession(r)
@@ -321,7 +287,7 @@ func handleVersionRestore(w http.ResponseWriter, r *http.Request, cfg *config.Co
 	if session != nil {
 		user = session.Username
 	}
-	logger.Info("User %s restored version %s of %s", user, timestamp, documentPath)
+	logger.Info("User %s restored version %s of %s", user, timestamp, doc.File())
 
 	// Return success response
 	response := map[string]interface{}{

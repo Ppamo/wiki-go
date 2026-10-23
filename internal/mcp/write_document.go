@@ -18,6 +18,7 @@ var (
 	// errRevisionMismatch leaves out the current revision so that the agent
 	// reads the document again before retrying
 	errRevisionMismatch = &toolError{"Revision mismatch: the document changed since you read it; read it again"}
+	errRevisionRequired = &toolError{"Invalid arguments: revision is required; read the document first"}
 	errDocumentExists   = &toolError{"Document exists; pass the revision from read_document to replace it"}
 )
 

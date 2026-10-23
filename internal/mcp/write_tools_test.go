@@ -109,15 +109,17 @@ func TestToolsListForEditors(t *testing.T) {
 		return strings.Join(names, ",")
 	}
 
-	if names := toolNames(wiki.financeToken); names != "search_documents,list_documents,read_document,edit_document,write_document,add_comment" {
-		t.Fatalf("editor tools = %s, want the 6 tools in registry order", names)
+	if names := toolNames(wiki.financeToken); names != "search_documents,list_documents,read_document,edit_document,write_document,add_comment,move_document,restore_version,delete_document" {
+		t.Fatalf("editor tools = %s, want the 9 tools in registry order", names)
 	}
 	// A viewer token of an editor only gets the viewer tools
 	if names := toolNames(cappedToken); names != "search_documents,list_documents,read_document,add_comment" {
 		t.Fatalf("viewer token tools = %s, want the 4 viewer tools", names)
 	}
-	for _, name := range []string{"edit_document", "write_document"} {
-		result := wiki.call(t, cappedToken, name, map[string]interface{}{"path": "guides/intro", "content": "# New", "revision": "x"})
+	for _, name := range []string{"edit_document", "write_document", "move_document", "restore_version", "delete_document"} {
+		result := wiki.call(t, cappedToken, name, map[string]interface{}{
+			"path": "guides/intro", "content": "# New", "revision": "x", "new_path": "guides/moved", "version": "20261022101500",
+		})
 		assertToolError(t, result, "Insufficient role: editor access required")
 	}
 	if wiki.content(t, "guides/intro") != "# Intro" {

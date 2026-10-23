@@ -39,6 +39,9 @@ func TestWriteToolAnnotationsDescribeDestructiveChanges(t *testing.T) {
 		{editDocumentTool, true},
 		{writeDocumentTool, true},
 		{addCommentTool, false},
+		{moveDocumentTool, false},
+		{restoreVersionTool, false},
+		{deleteDocumentTool, true},
 	}
 	for _, test := range tests {
 		if got := test.tool.annotations["destructiveHint"]; got != test.destructive {

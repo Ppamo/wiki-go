@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"wiki-go/internal/auth"
 	"wiki-go/internal/roles"
 )
@@ -55,6 +56,7 @@ func writeAnnotations(idempotent, destructive bool) map[string]interface{} {
 }
 
 // registry lists the tools in the order tools/list returns them.
+// delete_document, the only change that cannot be undone, goes last.
 var registry = []tool{
 	searchDocumentsTool,
 	listDocumentsTool,
@@ -62,6 +64,9 @@ var registry = []tool{
 	editDocumentTool,
 	writeDocumentTool,
 	addCommentTool,
+	moveDocumentTool,
+	restoreVersionTool,
+	deleteDocumentTool,
 }
 
 func findTool(name string) (tool, bool) {
@@ -102,4 +107,12 @@ func decodeArguments(arguments json.RawMessage, args interface{}) error {
 		return &toolError{"Invalid arguments: " + err.Error()}
 	}
 	return nil
+}
+
+// plural counts a noun for result texts: "1 document", "3 documents".
+func plural(count int, noun string) string {
+	if count == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", count, noun)
 }

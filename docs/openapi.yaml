@@ -355,8 +355,9 @@ paths:
         ignored); `""` or `"/"` is the home page.
 
         `tools/list` returns, in order: `search_documents`, `list_documents`,
-        `read_document`, `edit_document`, `write_document` and `add_comment`.
-        A viewer sees 4 tools; an editor or admin sees the 6.
+        `read_document`, `edit_document`, `write_document`, `add_comment`,
+        `move_document`, `restore_version` and `delete_document`. A viewer
+        sees 4 tools; an editor or admin sees the 9.
 
         Read-only tools (minimum role `viewer`):
         - `search_documents`: `{"query": "deploy not draft", "limit": 10}`
@@ -406,6 +407,46 @@ paths:
           comment as the token owner. Fails when comments are disabled, when the
           document has the `<!-- no comments -->` marker, or when the same user
           already commented on the document in the same second.
+
+        Structure tools (minimum role `editor`). They share the write lock with
+        the other write tools and the API. Moving or deleting requires access
+        to every directory of the subtree; otherwise the error says that the
+        section contains documents the caller cannot access, without naming or
+        counting them. Their result lists the accessible documents (up to 20)
+        that link to the old path with an absolute Markdown link
+        (`](/guides/old)`), a wikilink with the path (`[[guides/old]]`), an
+        attachment URL (`/api/files/guides/old/...`) or, when the last segment
+        changes, a wikilink by name (`[[old]]`), outside code blocks; relative
+        links are not detected. The home page cannot be moved, deleted or used
+        as a target.
+        - `move_document`:
+          `{"path": "guides/old-name", "new_path": "archive/new-name"}` moves the
+          document with its sub-documents, attachments, versions and comments;
+          if the versions or comments cannot be moved, nothing moves.
+          `new_path` must be canonical (letters, digits, `-`, `_` and `/`) and
+          accessible, like its parent, before the tool reveals whether it is
+          taken. When any moved document would fall under a different access
+          rule, the move fails with up to 3 examples (`finance/report:
+          restricted (/finance/**) → public`) unless `allow_access_change` is
+          `true`; this also applies to admins. Returns `Moved <path> →
+          <new_path> (N documents).` and the documents that link to the old path.
+        - `restore_version`:
+          `{"path": "guides/intro", "version": "20261022101500", "revision":
+          "9c1e4b7a2f0d3e55"}` saves the version as the current content through
+          the write path of `edit_document`: the current content is kept as a
+          new version and a stale `revision` is a mismatch. When the content is
+          already the version's, it returns `Unchanged` whatever the revision,
+          so a retry is idempotent. Returns `Restored <path> to version <ts>.`,
+          the new `revision` and the `previous version`.
+        - `delete_document`:
+          `{"path": "guides/obsolete", "revision": "9c1e4b7a2f0d3e55"}`
+          permanently deletes the document with its attachments, versions and
+          comments. `revision` is required when the path has a `document.md`
+          (a folder without one has no revision). A document with
+          sub-documents is only deleted with `"recursive": true`; otherwise the
+          error counts them. Returns `Deleted <path> (N sub-documents, M
+          attachments).`, the documents that linked to it and, if the versions
+          or comments could not be removed, `warnings`.
 
         Requests with an `Origin` header that does not match the host get `403`.
         An unsupported `MCP-Protocol-Version` header gets `400`. A message
@@ -523,6 +564,13 @@ paths:
       description: |
         Moves the document directory together with its versions and comments.
         Provide `targetPath`, `newSlug`, or both. The home page cannot be moved.
+        The user needs access to every directory of the moved subtree, at its
+        current and new path, and to the target and its parent; otherwise `403`.
+        If the versions or comments cannot be moved, the move is undone and
+        the response is `500`. A target directory that exists must be empty; a
+        rename that only changes the case of the name is allowed. Shares the
+        write lock with `/api/save` and the MCP tools, and refreshes the index
+        that resolves `[[name]]` wikilinks.
       x-required-role: editor
       requestBody:
         required: true
@@ -538,13 +586,17 @@ paths:
               schema:
                 $ref: "#/components/schemas/MoveResponse"
         "400":
-          description: Invalid request or paths.
+          description: Invalid request or paths, including a target inside the source.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/MoveResponse"
         "403":
-          $ref: "#/components/responses/Forbidden"
+          description: The source, the target or a directory of the moved subtree is not accessible.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MoveResponse"
         "404":
           description: Source document or category not found.
           content:
@@ -554,13 +606,17 @@ paths:
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
         "409":
-          description: The target already exists.
+          description: The target already exists and is not an empty directory.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/MoveResponse"
         "500":
-          $ref: "#/components/responses/ServerError"
+          description: The move failed; nothing was moved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MoveResponse"
 
   /api/document/{docPath}:
     parameters:
@@ -596,6 +652,10 @@ paths:
       description: |
         Recursively deletes the document directory (including sub-documents and
         attachments) and its versions and comments. The home page cannot be deleted.
+        Deleting a directory requires access to every directory below it;
+        otherwise the response is `403` and nothing is deleted. Shares the
+        write lock with `/api/save` and the MCP tools, and refreshes the index
+        that resolves `[[name]]` wikilinks.
       x-required-role: editor
       responses:
         "200":
@@ -789,8 +849,11 @@ paths:
       operationId: restoreVersion
       summary: Restore a version
       description: |
-        Replaces the current document with the version. When `max_versions > 0`
-        the current content is saved as a new version first.
+        Replaces the current document with the version, through the write path
+        of `/api/save`: when `max_versions > 0` the current content is saved as
+        a new version first (the first version of a second is kept), the write
+        is atomic, and restoring content identical to the current one writes
+        nothing and creates no version.
       x-required-role: editor
       responses:
         "200":

@@ -78,7 +78,7 @@ func editDocument(ctx context.Context, s *Server, arguments json.RawMessage) ([]
 		return nil, err
 	}
 	if args.Revision == "" {
-		return nil, &toolError{"Invalid arguments: revision is required; read the document first"}
+		return nil, errRevisionRequired
 	}
 	if len(args.Edits) < 1 || len(args.Edits) > maxEdits {
 		return nil, &toolError{fmt.Sprintf("Invalid arguments: edits must have between 1 and %d items", maxEdits)}

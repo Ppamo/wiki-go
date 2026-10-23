@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 	"wiki-go/internal/config"
+	"wiki-go/internal/goldext"
 )
 
 func newTestConfig(t *testing.T) *config.Config {
@@ -318,6 +320,334 @@ func TestRevisionMatchesTheStageOneValues(t *testing.T) {
 	} {
 		if got := Revision([]byte(content)); got != want {
 			t.Errorf("Revision(%q) = %s, want %s", content, got, want)
+		}
+	}
+}
+
+// writeTree creates the files, given as slash paths below root.
+func writeTree(t *testing.T, root string, files map[string]string) {
+	t.Helper()
+	for name, content := range files {
+		path := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func assertExists(t *testing.T, root string, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(name))); err != nil {
+			t.Fatalf("stat %s = %v, want it to exist", name, err)
+		}
+	}
+}
+
+func assertMissing(t *testing.T, root string, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(name))); !os.IsNotExist(err) {
+			t.Fatalf("stat %s = %v, want it missing", name, err)
+		}
+	}
+}
+
+func allowMove([]Moved) error    { return nil }
+func allowDelete([]string) error { return nil }
+
+// oldGuide is a document with an attachment, history and comments.
+var oldGuide = map[string]string{
+	"documents/guides/old/document.md":                "# Old",
+	"documents/guides/old/chart.png":                  "png",
+	"versions/documents/guides/old/20261022101500.md": "# Old v1",
+	"comments/guides/old/20261022101500_alice.md":     "Nice",
+}
+
+func TestMoveCarriesTheSubtreeHistoryAndComments(t *testing.T) {
+	cfg := newTestConfig(t)
+	root := cfg.Wiki.RootDir
+	writeTree(t, root, oldGuide)
+	writeTree(t, root, map[string]string{
+		"documents/guides/old/.drafts/notes.txt":                "draft",
+		"documents/guides/old/child/document.md":                "# Child",
+		"versions/documents/guides/old/child/20261022101500.md": "# Child v1",
+		"comments/guides/old/child/20261022101500_bob.md":       "Ok",
+	})
+
+	var moved []Moved
+	err := Move(cfg, resolve(t, cfg, "guides/old"), resolve(t, cfg, "archive/new"), func(subtree []Moved) error {
+		moved = subtree
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Moved{
+		{From: "/guides/old", To: "/archive/new", IsDocument: true},
+		{From: "/guides/old/.drafts", To: "/archive/new/.drafts"},
+		{From: "/guides/old/child", To: "/archive/new/child", IsDocument: true},
+	}
+	if !reflect.DeepEqual(moved, want) {
+		t.Fatalf("check got %v, want every directory of the subtree %v", moved, want)
+	}
+	assertExists(t, root,
+		"documents/archive/new/document.md",
+		"documents/archive/new/chart.png",
+		"documents/archive/new/.drafts/notes.txt",
+		"documents/archive/new/child/document.md",
+		"versions/documents/archive/new/20261022101500.md",
+		"versions/documents/archive/new/child/20261022101500.md",
+		"comments/archive/new/20261022101500_alice.md",
+		"comments/archive/new/child/20261022101500_bob.md",
+	)
+	assertMissing(t, root, "documents/guides/old", "versions/documents/guides/old", "comments/guides/old")
+}
+
+func TestMoveCheckCanVetoTheMove(t *testing.T) {
+	cfg := newTestConfig(t)
+	root := cfg.Wiki.RootDir
+	writeTree(t, root, oldGuide)
+
+	veto := errors.New("veto")
+	err := Move(cfg, resolve(t, cfg, "guides/old"), resolve(t, cfg, "archive/deep/new"), func([]Moved) error { return veto })
+	if !errors.Is(err, veto) {
+		t.Fatalf("error = %v, want the veto", err)
+	}
+	assertExists(t, root, "documents/guides/old/document.md", "versions/documents/guides/old/20261022101500.md", "comments/guides/old/20261022101500_alice.md")
+	assertMissing(t, root, "documents/archive", "versions/documents/archive", "comments/archive")
+}
+
+func TestMoveRollsBackWhenTheCommentsCannotMove(t *testing.T) {
+	cfg := newTestConfig(t)
+	root := cfg.Wiki.RootDir
+	writeTree(t, root, oldGuide)
+	commentsRoot := filepath.Join(root, "comments")
+	previous := rename
+	rename = func(from, to string) error {
+		if strings.HasPrefix(from, commentsRoot) {
+			return errors.New("permission denied")
+		}
+		return previous(from, to)
+	}
+	t.Cleanup(func() { rename = previous })
+
+	err := Move(cfg, resolve(t, cfg, "guides/old"), resolve(t, cfg, "archive/new"), allowMove)
+	if err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("error = %v, want the comments rename failure", err)
+	}
+	assertExists(t, root, "documents/guides/old/document.md", "documents/guides/old/chart.png",
+		"versions/documents/guides/old/20261022101500.md", "comments/guides/old/20261022101500_alice.md")
+	assertMissing(t, root, "documents/archive", "versions/documents/archive", "comments/archive")
+}
+
+func TestMoveRejectsTargetsItCannotUse(t *testing.T) {
+	cfg := newTestConfig(t)
+	root := cfg.Wiki.RootDir
+	writeTree(t, root, map[string]string{
+		"documents/guides/old/document.md":   "# Old",
+		"documents/guides/taken/document.md": "# Taken",
+	})
+	if err := os.MkdirAll(filepath.Join(root, "documents", "guides", "empty"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	old := resolve(t, cfg, "guides/old")
+
+	tests := []struct {
+		src, dst string
+		want     error
+	}{
+		{"guides/old", "guides/old/sub", ErrInsideItself},
+		{"guides/old", "guides/taken", ErrTargetExists},
+		{"guides/missing", "guides/new", ErrNotFound},
+	}
+	for _, test := range tests {
+		if err := Move(cfg, resolve(t, cfg, test.src), resolve(t, cfg, test.dst), allowMove); !errors.Is(err, test.want) {
+			t.Fatalf("Move(%s, %s) error = %v, want %v", test.src, test.dst, err, test.want)
+		}
+	}
+	assertExists(t, root, "documents/guides/old/document.md", "documents/guides/taken/document.md")
+
+	// An empty directory is replaced, as in the API
+	if err := Move(cfg, old, resolve(t, cfg, "guides/empty"), allowMove); err != nil {
+		t.Fatalf("move onto an empty directory error = %v", err)
+	}
+	assertExists(t, root, "documents/guides/empty/document.md")
+
+	// Also where names are case-insensitive, where guides/Empty exists already
+	if err := Move(cfg, resolve(t, cfg, "guides/empty"), resolve(t, cfg, "guides/Empty"), allowMove); err != nil {
+		t.Fatalf("case-only rename error = %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "documents", "guides"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	if strings.Join(names, ",") != "Empty,taken" {
+		t.Fatalf("guides = %v, want the renamed Empty", names)
+	}
+}
+
+func TestDeleteRequiresRecursiveForSubDocuments(t *testing.T) {
+	cfg := newTestConfig(t)
+	root := cfg.Wiki.RootDir
+	writeTree(t, root, oldGuide)
+	writeTree(t, root, map[string]string{
+		"documents/guides/old/child/document.md":                "# Child",
+		"documents/guides/old/child/data.csv":                   "a,b",
+		"versions/documents/guides/old/child/20261022101500.md": "# Child v1",
+	})
+	doc := resolve(t, cfg, "guides/old")
+
+	_, err := Delete(cfg, doc, DeleteOptions{}, allowDelete)
+	var children *ChildrenError
+	if !errors.As(err, &children) || children.Count != 1 {
+		t.Fatalf("error = %v, want ChildrenError{1}", err)
+	}
+	assertExists(t, root, "documents/guides/old/child/document.md")
+
+	var checked []string
+	result, err := Delete(cfg, doc, DeleteOptions{ExpectedRevision: Revision([]byte("# Old")), Recursive: true}, func(dirs []string) error {
+		checked = dirs
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/guides/old", "/guides/old/child"}
+	if !reflect.DeepEqual(checked, want) || !reflect.DeepEqual(result.Documents, want) {
+		t.Fatalf("checked %v, deleted %v; want %v", checked, result.Documents, want)
+	}
+	if result.Attachments != 2 || result.Warnings != nil {
+		t.Fatalf("result = %+v, want 2 attachments and no warnings", result)
+	}
+	assertMissing(t, root, "documents/guides/old", "versions/documents/guides/old", "comments/guides/old")
+	assertExists(t, root, "documents/guides")
+}
+
+func TestDeleteKeepsTheDocumentOnAStaleRevisionOrAVeto(t *testing.T) {
+	cfg := newTestConfig(t)
+	root := cfg.Wiki.RootDir
+	writeTree(t, root, oldGuide)
+	doc := resolve(t, cfg, "guides/old")
+
+	if _, err := Delete(cfg, doc, DeleteOptions{ExpectedRevision: Revision([]byte("# Older"))}, allowDelete); !errors.Is(err, ErrRevisionMismatch) {
+		t.Fatalf("stale revision error = %v, want ErrRevisionMismatch", err)
+	}
+	veto := errors.New("veto")
+	if _, err := Delete(cfg, doc, DeleteOptions{}, func([]string) error { return veto }); !errors.Is(err, veto) {
+		t.Fatalf("veto error = %v, want the veto", err)
+	}
+	if _, err := Delete(cfg, resolve(t, cfg, "guides/missing"), DeleteOptions{}, allowDelete); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing document error = %v, want ErrNotFound", err)
+	}
+	assertExists(t, root, "documents/guides/old/document.md", "versions/documents/guides/old/20261022101500.md", "comments/guides/old/20261022101500_alice.md")
+}
+
+func TestReferences(t *testing.T) {
+	cfg := newTestConfig(t)
+	writeTree(t, cfg.Wiki.RootDir, map[string]string{
+		"pages/home/document.md":                  "# Home\n\n[Old](/guides/old)",
+		"documents/guides/index/document.md":      "See [setup](/guides/old#setup).",
+		"documents/guides/old/document.md":        "# Old",
+		"documents/guides/old/child/document.md":  "[parent](/guides/old)",
+		"documents/ops/attachment/document.md":    "![chart](/api/files/guides/old/chart.png)",
+		"documents/ops/by-name/document.md":       "Read [[old]] first.",
+		"documents/ops/child-link/document.md":    "[child](/guides/old/child \"Child\")",
+		"documents/ops/code/document.md":          "```\n[x](/guides/old)\n```\n\nUse `[[guides/old]]`.",
+		"documents/ops/prefix/document.md":        "[x](/guides/older) and [[guides/older]] and [[older]]",
+		"documents/ops/wikilink/document.md":      "[[guides/old|Old guide]]",
+		"documents/.drafts/hidden/document.md":    "[x](/guides/old)",
+		"documents/ops/no-document/attachment.md": "[x](/guides/old)",
+	})
+
+	references, err := References(cfg, "/guides/old", "/guides/old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/", "/guides/index", "/ops/attachment", "/ops/by-name", "/ops/child-link", "/ops/wikilink"}
+	if !reflect.DeepEqual(references, want) {
+		t.Fatalf("references after a delete = %v, want %v", references, want)
+	}
+
+	// A move that keeps the name leaves [[old]] working
+	if err := Move(cfg, resolve(t, cfg, "guides/old"), resolve(t, cfg, "archive/old"), allowMove); err != nil {
+		t.Fatal(err)
+	}
+	references, err = References(cfg, "/guides/old", "/archive/old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = []string{"/", "/guides/index", "/ops/attachment", "/ops/child-link", "/ops/wikilink"}
+	if !reflect.DeepEqual(references, want) {
+		t.Fatalf("references after a move = %v, want %v without the moved subtree", references, want)
+	}
+
+	// A rename breaks it
+	if err := Move(cfg, resolve(t, cfg, "archive/old"), resolve(t, cfg, "archive/renamed"), allowMove); err != nil {
+		t.Fatal(err)
+	}
+	references, err = References(cfg, "/archive/old", "/archive/renamed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(references, []string{"/ops/by-name"}) {
+		t.Fatalf("references after a rename = %v, want the link by name", references)
+	}
+}
+
+func TestStructureChangesInvalidateTheWikilinkIndex(t *testing.T) {
+	cfg := newTestConfig(t)
+	goldext.ConfigureContentPaths(cfg.Wiki.RootDir, cfg.Wiki.DocumentsDir)
+	t.Cleanup(func() { goldext.ConfigureContentPaths("data", "documents") })
+	documentsRoot := filepath.Join(cfg.Wiki.RootDir, cfg.Wiki.DocumentsDir)
+	save(t, cfg, resolve(t, cfg, "guides/intro"), "# Intro", SaveOptions{})
+
+	// Every change happens below guides/, which leaves the mtime of
+	// documents/ as it was unless the change touches it
+	steps := []struct {
+		name   string
+		change func() error
+		link   string
+		want   string
+	}{
+		{"save that creates", func() error {
+			_, err := Save(cfg, resolve(t, cfg, "guides/sub/setup"), []byte("# Setup"), SaveOptions{})
+			return err
+		}, "[[setup]]", "[setup](/guides/sub/setup)"},
+		{"move", func() error {
+			return Move(cfg, resolve(t, cfg, "guides/intro"), resolve(t, cfg, "guides/sub/intro"), allowMove)
+		}, "[[intro]]", "[intro](/guides/sub/intro)"},
+		{"delete", func() error {
+			_, err := Delete(cfg, resolve(t, cfg, "guides/sub/intro"), DeleteOptions{}, allowDelete)
+			return err
+		}, "[[intro]]", "[intro](/intro)"},
+	}
+	past := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, step := range steps {
+		if err := os.Chtimes(documentsRoot, past, past); err != nil {
+			t.Fatal(err)
+		}
+		// Builds the index for the current mtime
+		before := goldext.WikiLinkPreprocessor(step.link, "/")
+		if err := step.change(); err != nil {
+			t.Fatalf("%s: %v", step.name, err)
+		}
+		info, err := os.Stat(documentsRoot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.ModTime().Equal(past) {
+			t.Fatalf("%s: the mtime of documents/ did not change", step.name)
+		}
+		if got := goldext.WikiLinkPreprocessor(step.link, "/"); got != step.want {
+			t.Fatalf("%s: %s renders %q (before: %q), want %q", step.name, step.link, got, before, step.want)
 		}
 	}
 }

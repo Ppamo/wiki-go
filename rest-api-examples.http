@@ -87,7 +87,7 @@ Content-Type: application/json
 
 {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "read_document", "arguments": {"path": "{{ doc_path }}", "include": ["attachments", "comments"]}}}
 
-#### MCP: create a token that can edit (edit_document and write_document need role editor)
+#### MCP: create a token that can edit (the write tools except add_comment need role editor)
 # @name createEditorToken
 POST {{ base_url }}/api/tokens
 Content-Type: application/json
@@ -133,6 +133,34 @@ Authorization: Bearer {{ createToken.response.body.token }}
 Content-Type: application/json
 
 {"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {"name": "add_comment", "arguments": {"path": "{{ doc_path }}", "content": "Updated the content through MCP."}}}
+
+#### MCP: read the revision and the history of the created document
+POST {{ base_url }}/mcp
+Authorization: Bearer {{ createEditorToken.response.body.token }}
+Content-Type: application/json
+
+{"jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": {"name": "read_document", "arguments": {"path": "api-testing/mcp-created", "include": ["history"]}}}
+
+#### MCP: restore a version (replace "version" and "revision" with values from read_document)
+POST {{ base_url }}/mcp
+Authorization: Bearer {{ createEditorToken.response.body.token }}
+Content-Type: application/json
+
+{"jsonrpc": "2.0", "id": 12, "method": "tools/call", "params": {"name": "restore_version", "arguments": {"path": "api-testing/mcp-created", "version": "20261022101500", "revision": "0000000000000000"}}}
+
+#### MCP: move a document with its history and comments; lists the documents that link to the old path
+POST {{ base_url }}/mcp
+Authorization: Bearer {{ createEditorToken.response.body.token }}
+Content-Type: application/json
+
+{"jsonrpc": "2.0", "id": 13, "method": "tools/call", "params": {"name": "move_document", "arguments": {"path": "api-testing/mcp-created", "new_path": "api-testing/mcp-moved"}}}
+
+#### MCP: delete a document permanently (needs its revision; add "recursive": true for sub-documents)
+POST {{ base_url }}/mcp
+Authorization: Bearer {{ createEditorToken.response.body.token }}
+Content-Type: application/json
+
+{"jsonrpc": "2.0", "id": 14, "method": "tools/call", "params": {"name": "delete_document", "arguments": {"path": "api-testing/mcp-moved", "revision": "0000000000000000"}}}
 
 #### MCP: revoke the editor token
 DELETE {{ base_url }}/api/tokens?name=mcp-editor

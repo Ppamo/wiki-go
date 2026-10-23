@@ -25,7 +25,11 @@ const serverInstructions = "Wiki-Go documents are Markdown pages addressed by pa
 	"replacements) or write_document (whole content); a revision mismatch means someone else " +
 	"changed it, so read it again. write_document without revision creates a new document. " +
 	"Use add_comment to explain changes. " +
-	"Results only include the documents your role and groups may access."
+	"Results only include the documents your role and groups may access. " +
+	"move_document and delete_document list the documents that link to the old path; fix " +
+	"them with edit_document. Ask the user before passing allow_access_change or before " +
+	"deleting: delete_document cannot be undone. restore_version undoes a change using the " +
+	"history from read_document."
 
 // LatestProtocolVersion is offered to clients that ask for an unknown version.
 const LatestProtocolVersion = "2025-06-18"

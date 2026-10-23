@@ -26,11 +26,20 @@ func CanAccessDocument(path string, session *Session, cfg *config.Config) bool {
 	return checkAccessRule(rule, session)
 }
 
-func findMatchingRule(path string, rules []config.AccessRule) *config.AccessRule {
-	for _, rule := range rules {
+// MatchingRuleIndex returns the index of the first rule that applies to path,
+// or -1 when none does and the wiki default applies.
+func MatchingRuleIndex(path string, rules []config.AccessRule) int {
+	for i, rule := range rules {
 		if matchPattern(rule.Pattern, path) {
-			return &rule
+			return i
 		}
+	}
+	return -1
+}
+
+func findMatchingRule(path string, rules []config.AccessRule) *config.AccessRule {
+	if i := MatchingRuleIndex(path, rules); i >= 0 {
+		return &rules[i]
 	}
 	return nil
 }
