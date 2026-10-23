@@ -21,6 +21,10 @@ import (
 const serverInstructions = "Wiki-Go documents are Markdown pages addressed by path, " +
 	"for example \"guides/intro\"; \"/\" is the home page. Find documents with " +
 	"search_documents or browse them with list_documents, then read one with read_document. " +
+	"To change a document pass the revision from read_document to edit_document (exact " +
+	"replacements) or write_document (whole content); a revision mismatch means someone else " +
+	"changed it, so read it again. write_document without revision creates a new document. " +
+	"Use add_comment to explain changes. " +
 	"Results only include the documents your role and groups may access."
 
 // LatestProtocolVersion is offered to clients that ask for an unknown version.
@@ -138,6 +142,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var req rpcRequest
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBytes))
 	if err := decoder.Decode(&req); err != nil {
+		// The body did not arrive whole, so there is no id to answer with
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeHTTPError(w, http.StatusRequestEntityTooLarge, "Request too large (limit 1 MiB)")
+			return
+		}
 		writeRPC(w, rpcResponse{ID: json.RawMessage("null"), Error: &rpcError{codeParseError, "Parse error"}})
 		return
 	}

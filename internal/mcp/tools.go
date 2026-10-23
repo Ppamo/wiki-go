@@ -44,11 +44,24 @@ var readOnlyAnnotations = map[string]interface{}{
 	"openWorldHint": false,
 }
 
+// writeAnnotations marks tools that change the wiki.
+func writeAnnotations(idempotent, destructive bool) map[string]interface{} {
+	return map[string]interface{}{
+		"readOnlyHint":    false,
+		"destructiveHint": destructive,
+		"idempotentHint":  idempotent,
+		"openWorldHint":   false,
+	}
+}
+
 // registry lists the tools in the order tools/list returns them.
 var registry = []tool{
 	searchDocumentsTool,
 	listDocumentsTool,
 	readDocumentTool,
+	editDocumentTool,
+	writeDocumentTool,
+	addCommentTool,
 }
 
 func findTool(name string) (tool, bool) {

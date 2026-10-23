@@ -226,8 +226,8 @@ func TestMCPProtocolLifecycle(t *testing.T) {
 	for _, tool := range list.Result.Tools {
 		names = append(names, tool.Name)
 	}
-	if strings.Join(names, ",") != "search_documents,list_documents,read_document" {
-		t.Fatalf("tools = %v, want the read-only tools in registry order", names)
+	if strings.Join(names, ",") != "search_documents,list_documents,read_document,add_comment" {
+		t.Fatalf("tools = %v, want the viewer tools in registry order", names)
 	}
 
 	unknown := decodeRPC(t, wiki.post(t, wiki.viewerToken, `{"jsonrpc":"2.0","id":4,"method":"resources/list"}`))

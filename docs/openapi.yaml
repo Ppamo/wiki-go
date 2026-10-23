@@ -354,7 +354,11 @@ paths:
         Document paths use `"guides/intro"` (leading and trailing slashes are
         ignored); `""` or `"/"` is the home page.
 
-        Tools (all read-only, minimum role `viewer`):
+        `tools/list` returns, in order: `search_documents`, `list_documents`,
+        `read_document`, `edit_document`, `write_document` and `add_comment`.
+        A viewer sees 4 tools; an editor or admin sees the 6.
+
+        Read-only tools (minimum role `viewer`):
         - `search_documents`: `{"query": "deploy not draft", "limit": 10}`
           runs the full-text search of `/api/search` and returns the path, title
           and excerpt of up to `limit` matches (default 10, max 50). An empty
@@ -373,8 +377,39 @@ paths:
           like `/api/versions`. Missing and forbidden documents both return a
           tool result with `isError: true` and the same message.
 
+        Write tools. They write through the same path as `/api/save` (versions,
+        atomic write and lock) and check the document `revision` from
+        `read_document` to detect concurrent changes. A stale revision returns
+        `Revision mismatch: the document changed since you read it; read it
+        again`, without the current revision. Missing and forbidden documents
+        return the same error, also when writing, and nothing is created on
+        disk before the access check passes. Each write is logged with the
+        user, token and path.
+        - `edit_document` (minimum role `editor`):
+          `{"path": "guides/intro", "revision": "9c1e4b7a2f0d3e55", "edits":
+          [{"old_text": "port 80", "new_text": "port 8080"}]}` applies 1 to 50
+          exact replacements in order and saves all or none. Without
+          `replace_all`, each `old_text` must match exactly once (byte by byte,
+          overlapping matches count). An edit that would leave the document
+          empty is rejected. Returns `Saved <path> (N edits applied).` plus
+          `revision` and, when one was stored, `previous version`.
+        - `write_document` (minimum role `editor`):
+          `{"path": "guides/deploy", "content": "# Deploy\n..."}` creates a
+          document and fails if it exists; with `revision` it replaces an
+          existing document. New paths must already be canonical (letters,
+          digits, `-`, `_` and `/`); otherwise the error suggests one. No
+          template is generated: the content brings its `#` title and front
+          matter. Identical content returns `Unchanged` with or without
+          `revision`, so a retry is idempotent.
+        - `add_comment` (minimum role `viewer`, like `/api/comments/add`):
+          `{"path": "guides/intro", "content": "Fixed the port"}` adds a
+          comment as the token owner. Fails when comments are disabled, when the
+          document has the `<!-- no comments -->` marker, or when the same user
+          already commented on the document in the same second.
+
         Requests with an `Origin` header that does not match the host get `403`.
-        An unsupported `MCP-Protocol-Version` header gets `400`.
+        An unsupported `MCP-Protocol-Version` header gets `400`. A message
+        larger than 1 MiB (with the content escaped in JSON) gets `413`.
       x-required-role: viewer
       requestBody:
         required: true
@@ -431,6 +466,15 @@ paths:
                 $ref: "#/components/schemas/GenericResponse"
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
+        "413":
+          description: |
+            The message is larger than 1 MiB. The body did not arrive whole, so
+            the answer is not a JSON-RPC response: `{"success": false,
+            "message": "Request too large (limit 1 MiB)"}`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
 
   # ----------------------------------------------------------- Documents
   /api/document/create:
@@ -613,8 +657,13 @@ paths:
       summary: Save the raw Markdown of a document
       description: |
         Overwrites `document.md` with the request body, creating the directory if
-        needed. When `max_versions > 0` the previous content is stored as a version.
-        Use `/api/save/` (empty path) for the home page.
+        needed. The write is atomic (temporary file and rename) and shares its
+        lock with the MCP write tools. When `max_versions > 0` the previous
+        content is stored as a version; if a version of the same second exists,
+        it is kept and no new one is stored. Saving identical content writes
+        nothing and stores no version. There is no concurrency check: the
+        request does not carry a revision. Use `/api/save/` (empty path) for the
+        home page.
       x-required-role: editor
       requestBody:
         required: true
@@ -804,7 +853,9 @@ paths:
       summary: Add a comment to a document
       description: |
         Fails with `403` when comments are disabled wiki-wide or by the
-        document's front matter.
+        document's front matter. Comment IDs are `<yyyymmddhhmmss>_<user>.md`,
+        so a second comment by the same user on the same document in the same
+        second gets `409` and the first one is kept.
       x-required-role: viewer
       requestBody:
         required: true
@@ -825,6 +876,12 @@ paths:
           $ref: "#/components/responses/NotFound"
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          description: The user already commented on this document in the same second; retry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
         "500":
           $ref: "#/components/responses/ServerError"
 

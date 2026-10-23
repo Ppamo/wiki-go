@@ -7,6 +7,7 @@ import (
 	"wiki-go/internal/auth"
 	"wiki-go/internal/comments"
 	"wiki-go/internal/config"
+	"wiki-go/internal/documents"
 )
 
 func (w *testWiki) call(t *testing.T, token, name string, arguments interface{}) rpcResult {
@@ -28,6 +29,22 @@ func firstText(result rpcResult) string {
 		return ""
 	}
 	return result.Result.Content[0].Text
+}
+
+func TestWriteToolAnnotationsDescribeDestructiveChanges(t *testing.T) {
+	tests := []struct {
+		tool        tool
+		destructive bool
+	}{
+		{editDocumentTool, true},
+		{writeDocumentTool, true},
+		{addCommentTool, false},
+	}
+	for _, test := range tests {
+		if got := test.tool.annotations["destructiveHint"]; got != test.destructive {
+			t.Errorf("%s destructiveHint = %v, want %v", test.tool.name, got, test.destructive)
+		}
+	}
 }
 
 func TestSearchDocumentsAppliesAccessRules(t *testing.T) {
@@ -138,7 +155,7 @@ func TestReadDocumentSections(t *testing.T) {
 	})
 	metadata := firstText(result)
 	for _, want := range []string{
-		"path: guides/intro\nrevision: " + contentRevision([]byte("# Intro")) + "\n",
+		"path: guides/intro\nrevision: " + documents.Revision([]byte("# Intro")) + "\n",
 		"attachments:\n- chart.png (image/png, 3 bytes)\n",
 		"comments (oldest first):\n- alice, ",
 		"  Looks good\n  Ship it\n",

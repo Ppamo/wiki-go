@@ -2,8 +2,6 @@ package mcp
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,6 +10,7 @@ import (
 	"strings"
 	"wiki-go/internal/comments"
 	"wiki-go/internal/config"
+	"wiki-go/internal/documents"
 	"wiki-go/internal/logger"
 	"wiki-go/internal/roles"
 	"wiki-go/internal/utils"
@@ -95,7 +94,7 @@ func readDocument(ctx context.Context, s *Server, arguments json.RawMessage) ([]
 	if err != nil {
 		return nil, err
 	}
-	content, err := os.ReadFile(doc.file())
+	content, err := os.ReadFile(doc.File())
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, errDocumentUnavailable
@@ -104,11 +103,11 @@ func readDocument(ctx context.Context, s *Server, arguments json.RawMessage) ([]
 	}
 
 	var metadata strings.Builder
-	fmt.Fprintf(&metadata, "path: %s\n", doc.displayPath())
+	fmt.Fprintf(&metadata, "path: %s\n", displayPath(doc.LogicalPath))
 	if args.Version == "" {
-		fmt.Fprintf(&metadata, "revision: %s\n", contentRevision(content))
+		fmt.Fprintf(&metadata, "revision: %s\n", documents.Revision(content))
 	} else {
-		content, err = os.ReadFile(filepath.Join(doc.versionsDir, args.Version+".md"))
+		content, err = os.ReadFile(filepath.Join(doc.VersionsDir, args.Version+".md"))
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil, &toolError{"Version not found; include history to list the versions"}
@@ -140,20 +139,13 @@ func readDocument(ctx context.Context, s *Server, arguments json.RawMessage) ([]
 		metadata.WriteString("\n" + section)
 	}
 
-	logger.Debug("MCP read_document %s by %s (token %q)", doc.logicalPath, session.Username, session.TokenName)
+	logger.Debug("MCP read_document %s by %s (token %q)", doc.LogicalPath, session.Username, session.TokenName)
 	return []string{metadata.String(), string(content)}, nil
 }
 
-// contentRevision identifies the content of a document, so that a later
-// change can detect that someone else edited it in between.
-func contentRevision(content []byte) string {
-	sum := sha256.Sum256(content)
-	return hex.EncodeToString(sum[:8])
-}
-
 // attachmentsSection lists the files the API would list for the document.
-func attachmentsSection(cfg *config.Config, doc document) (string, error) {
-	files, err := os.ReadDir(doc.dir)
+func attachmentsSection(cfg *config.Config, doc documents.Document) (string, error) {
+	files, err := os.ReadDir(doc.Dir)
 	if err != nil {
 		return "", err
 	}
@@ -179,8 +171,8 @@ func attachmentsSection(cfg *config.Config, doc document) (string, error) {
 }
 
 // historySection lists the stored versions, newest first.
-func historySection(doc document) (string, error) {
-	files, err := os.ReadDir(doc.versionsDir)
+func historySection(doc documents.Document) (string, error) {
+	files, err := os.ReadDir(doc.VersionsDir)
 	if err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
@@ -199,11 +191,11 @@ func historySection(doc document) (string, error) {
 }
 
 // commentsSection returns the raw Markdown of the comments, oldest first.
-func commentsSection(cfg *config.Config, doc document) (string, error) {
+func commentsSection(cfg *config.Config, doc documents.Document) (string, error) {
 	if cfg.Wiki.DisableComments {
 		return "comments: disabled in this wiki\n", nil
 	}
-	list, err := comments.GetComments(filepath.Join(cfg.Wiki.RootDir, "comments"), doc.logicalPath)
+	list, err := comments.GetComments(filepath.Join(cfg.Wiki.RootDir, "comments"), doc.LogicalPath)
 	if err != nil {
 		return "", err
 	}
