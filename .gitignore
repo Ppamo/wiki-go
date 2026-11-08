@@ -4,6 +4,7 @@
 *.dll
 *.so
 *.dylib
+.DS_Store
 
 # Build directory
 /build/
@@ -40,6 +41,7 @@ cmd
 *.md
 **/*.md
 !demo-site-files/**/*.md
+!docs/**/*.md
 # except repository documentation
 !README.md
 !SECURITY.md
