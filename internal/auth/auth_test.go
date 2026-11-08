@@ -101,3 +101,22 @@ func TestCheckAccessCanonicalizesBeforeRuleMatching(t *testing.T) {
 		})
 	}
 }
+
+func TestMatchingRuleIndexReturnsTheFirstMatchingRule(t *testing.T) {
+	rules := []config.AccessRule{
+		{Pattern: "/finance/public", Access: "public"},
+		{Pattern: "/finance/**", Access: "restricted", Groups: []string{"finance"}},
+		{Pattern: "/**", Access: "private"},
+	}
+	for path, want := range map[string]int{
+		"/finance/public": 0,
+		"/finance":        1,
+		"/finance/report": 1,
+		"/":               2,
+		"/guides/intro":   -1,
+	} {
+		if got := MatchingRuleIndex(path, rules); got != want {
+			t.Errorf("MatchingRuleIndex(%q) = %d, want %d", path, got, want)
+		}
+	}
+}

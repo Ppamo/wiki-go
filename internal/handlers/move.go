@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"wiki-go/internal/auth"
 	"wiki-go/internal/config"
+	"wiki-go/internal/documents"
 	"wiki-go/internal/logger"
 	"wiki-go/internal/utils"
 )
@@ -193,43 +195,6 @@ func MoveDocumentHandler(w http.ResponseWriter, r *http.Request, cfg *config.Con
 	// Log the calculated paths
 	logger.Debug("Calculated paths: newPath=%s, fullTargetPath=%s", newPath, fullTargetPath)
 
-	// Check if target already exists, but only if it's not the same as the source
-	// We need to check if the document.md file exists at the target path
-	targetDocPath := filepath.Join(fullTargetPath, "document.md")
-
-	// Skip the check if the target is the same as the source (just in a different location)
-	// This allows moving a document to the root with the same name
-	if fullTargetPath != fullSourcePath {
-		if _, err := os.Stat(targetDocPath); err == nil {
-			// Check if this is a case-only rename (e.g., "test" to "Test")
-			sourceBaseLower := strings.ToLower(path.Base(moveReq.SourcePath))
-			targetBaseLower := strings.ToLower(moveReq.NewSlug)
-
-			// If it's not a case-only rename, then it's a conflict
-			if sourceBaseLower != targetBaseLower || filepath.Dir(fullSourcePath) == filepath.Dir(fullTargetPath) {
-				sendJSONResponse(w, false, "A document already exists at the target location", http.StatusConflict, "", "")
-				return
-			}
-		}
-
-		// Also check if the directory itself exists and is not empty
-		if info, err := os.Stat(fullTargetPath); err == nil && info.IsDir() {
-			// Check if the directory is empty
-			entries, err := os.ReadDir(fullTargetPath)
-			if err == nil && len(entries) > 0 {
-				sendJSONResponse(w, false, "Target directory already exists and is not empty", http.StatusConflict, "", "")
-				return
-			}
-		}
-	}
-
-	// Create target directory if it doesn't exist
-	targetDir := filepath.Dir(fullTargetPath)
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		sendJSONResponse(w, false, "Failed to create target directory: "+err.Error(), http.StatusInternalServerError, "", "")
-		return
-	}
-
 	// Check if source and target are the same
 	if fullSourcePath == fullTargetPath {
 		logger.Warn("Source and target paths are the same, aborting move")
@@ -237,8 +202,37 @@ func MoveDocumentHandler(w http.ResponseWriter, r *http.Request, cfg *config.Con
 		return
 	}
 
-	// Move the document or category
-	if err := os.Rename(fullSourcePath, fullTargetPath); err != nil {
+	// Move the document or category with its versions and comments; a
+	// failure leaves everything in place. Every directory of the moved
+	// subtree must be accessible at its old and new path.
+	src, srcErr := documents.Resolve(cfg, source.LogicalPath)
+	dst, dstErr := documents.Resolve(cfg, target.LogicalPath)
+	if srcErr != nil || dstErr != nil {
+		sendJSONResponse(w, false, "Invalid target path", http.StatusBadRequest, "", "")
+		return
+	}
+	err = documents.Move(cfg, src, dst, func(moved []documents.Moved) error {
+		for _, m := range moved {
+			if !canAccessLogicalDocument(session, cfg, m.From) || !canAccessLogicalDocument(session, cfg, m.To) {
+				return errSubtreeAccess
+			}
+		}
+		return nil
+	})
+	switch {
+	case errors.Is(err, errSubtreeAccess):
+		sendJSONResponse(w, false, "Document access denied", http.StatusForbidden, "", "")
+		return
+	case errors.Is(err, documents.ErrNotFound):
+		sendJSONResponse(w, false, "Source document or category not found", http.StatusNotFound, "", "")
+		return
+	case errors.Is(err, documents.ErrTargetExists):
+		sendJSONResponse(w, false, "A document already exists at the target location", http.StatusConflict, "", "")
+		return
+	case errors.Is(err, documents.ErrInsideItself):
+		sendJSONResponse(w, false, "Cannot move a document inside itself", http.StatusBadRequest, "", "")
+		return
+	case err != nil:
 		logger.Error("Error moving document: %v", err)
 		sendJSONResponse(w, false, "Failed to move: "+err.Error(), http.StatusInternalServerError, "", "")
 		return
@@ -247,61 +241,6 @@ func MoveDocumentHandler(w http.ResponseWriter, r *http.Request, cfg *config.Con
 	logger.Info("User %s moved %s -> %s", session.Username,
 		filepath.Join(cfg.Wiki.RootDir, cfg.Wiki.DocumentsDir, moveReq.SourcePath),
 		filepath.Join(cfg.Wiki.RootDir, cfg.Wiki.DocumentsDir, newPath))
-
-	// Handle versions directory
-	var versionsSourcePath, versionsTargetPath string
-
-	if moveReq.SourcePath == "pages/home" {
-		// For homepage, use the new paths
-		versionsSourcePath = filepath.Join(cfg.Wiki.RootDir, "versions", "pages", "home")
-	} else if strings.HasPrefix(moveReq.SourcePath, "documents/") {
-		// Source path already includes "documents/" prefix
-		versionsSourcePath = filepath.Join(cfg.Wiki.RootDir, "versions", moveReq.SourcePath)
-	} else {
-		// Add "documents/" prefix for regular documents
-		versionsSourcePath = filepath.Join(cfg.Wiki.RootDir, "versions", "documents", moveReq.SourcePath)
-	}
-
-	if newPath == "pages/home" {
-		// For homepage, use the new paths
-		versionsTargetPath = filepath.Join(cfg.Wiki.RootDir, "versions", "pages", "home")
-	} else if strings.HasPrefix(newPath, "documents/") {
-		// Target path already includes "documents/" prefix
-		versionsTargetPath = filepath.Join(cfg.Wiki.RootDir, "versions", newPath)
-	} else {
-		// Add "documents/" prefix for regular documents
-		versionsTargetPath = filepath.Join(cfg.Wiki.RootDir, "versions", "documents", newPath)
-	}
-
-	// Check if versions directory exists
-	if _, err := os.Stat(versionsSourcePath); err == nil {
-		// Create parent directory for versions if needed
-		if err := os.MkdirAll(filepath.Dir(versionsTargetPath), 0755); err != nil {
-			logger.Warn("Failed to create versions target directory: %v", err)
-		} else {
-			// Move versions directory
-			if err := os.Rename(versionsSourcePath, versionsTargetPath); err != nil {
-				logger.Warn("Failed to move versions directory: %v", err)
-			}
-		}
-	}
-
-	// Handle comments directory
-	commentsSourcePath := filepath.Join(cfg.Wiki.RootDir, "comments", moveReq.SourcePath)
-	commentsTargetPath := filepath.Join(cfg.Wiki.RootDir, "comments", newPath)
-
-	// Check if comments directory exists
-	if _, err := os.Stat(commentsSourcePath); err == nil {
-		// Create parent directory for comments if needed
-		if err := os.MkdirAll(filepath.Dir(commentsTargetPath), 0755); err != nil {
-			logger.Warn("Failed to create comments target directory: %v", err)
-		} else {
-			// Move comments directory
-			if err := os.Rename(commentsSourcePath, commentsTargetPath); err != nil {
-				logger.Warn("Failed to move comments directory: %v", err)
-			}
-		}
-	}
 
 	// Return success response with both old and new paths
 	sendJSONResponse(w, true, "Document moved successfully", http.StatusOK, newPath, moveReq.SourcePath)

@@ -137,8 +137,10 @@ func ImportHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
 	}
 	importJobsMutex.Unlock()
 
-	// Start the import process in a goroutine
-	go processImportFromBytes(fileBytes, jobID, cfg, session.Username)
+	// The request-level configuration read lock is released when this handler
+	// returns, so give the background job its own immutable snapshot.
+	configSnapshot := *cfg
+	go processImportFromBytes(fileBytes, jobID, &configSnapshot, session.Username)
 
 	// Return success response with job ID
 	w.WriteHeader(http.StatusOK)

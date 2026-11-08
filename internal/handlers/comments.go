@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -144,6 +145,10 @@ func AddCommentHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Add the comment
 	err = comments.AddComment(commentsRoot(), document.logicalPath, req.Content, session.Username)
+	if errors.Is(err, comments.ErrCommentExists) {
+		sendJSONError(w, "You already commented on this document this second; retry", http.StatusConflict, "")
+		return
+	}
 	if err != nil {
 		sendJSONError(w, "Failed to add comment", http.StatusInternalServerError, err.Error())
 		return

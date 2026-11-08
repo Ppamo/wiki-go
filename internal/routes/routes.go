@@ -13,6 +13,7 @@ import (
 	"wiki-go/internal/config"
 	"wiki-go/internal/handlers"
 	"wiki-go/internal/logger"
+	"wiki-go/internal/mcp"
 	"wiki-go/internal/resources"
 )
 
@@ -331,6 +332,10 @@ func SetupRoutes(cfg *config.Config) {
 	mux.HandleFunc("/api/logout", handlers.LogoutHandler)
 	mux.HandleFunc("/api/password", handlers.PasswordHandler)
 	mux.HandleFunc("/api/check-default-password", handlers.CheckDefaultPasswordHandler)
+	mux.HandleFunc("/api/tokens", handlers.TokensHandler)
+
+	// MCP endpoint for agents; authenticated with the same session resolver
+	mux.Handle("/mcp", mcp.NewServer(cfg))
 	mux.HandleFunc("/api/document/create", handlers.CreateDocumentHandler)
 	mux.HandleFunc("/api/document/", handlers.DocumentHandler)
 	mux.HandleFunc("/api/source/", handlers.SourceHandler)
@@ -487,7 +492,7 @@ func SetupRoutes(cfg *config.Config) {
 	})
 
 	// Apply middleware to all routes
-	handler := CSPMiddleware(mux)
+	handler := handlers.ConfigReadMiddleware(CSPMiddleware(mux))
 
 	// Set the handler for the default ServeMux
 	http.Handle("/", handler)

@@ -1,0 +1,2900 @@
+openapi: 3.1.0
+info:
+  title: Wiki-Go API
+  version: "1.0.0"
+  description: |
+    HTTP API exposed by Wiki-Go (`internal/routes/routes.go`).
+
+    **Authentication.** Every endpoint resolves the caller with the same
+    credential resolver, which accepts, in this order:
+
+    1. The `session_token` cookie created by `POST /api/login`. The server sets
+       two cookies: `session_token` (HTTP-only, the actual credential) and
+       `session_user` (readable by JavaScript, informational only).
+    2. An `Authorization: Bearer <token>` header carrying either a session token
+       or a personal access token (prefix `wgo_pat_`, see `/api/tokens`).
+
+    Personal access tokens are meant for API and MCP clients. They act as their
+    owner with the owner's current role and groups, capped by the token's
+    optional `role`. They are revoked when the owner's password changes.
+
+    **Roles.** Users have one of three roles: `admin` > `editor` > `viewer`.
+    The minimum role for each operation is given in its description and in the
+    `x-required-role` extension (`none` means anonymous access is allowed).
+    Endpoints wrapped in the admin/editor middleware reply `403` with
+    `{"success": false, "message": ...}` before the handler runs; handlers that do
+    their own check usually reply `401` instead.
+
+    **Document paths.** Path parameters named `docPath` or `filePath` are
+    *multi-segment*: they may contain `/` (for example `finance/finance-report`).
+    The home page is addressed as `/` or `pages/home` depending on the endpoint,
+    as noted on each one. Document access rules (`/api/access-rules`) are
+    applied on top of roles; a request for a document the user cannot see gets
+    `403` (or `401` when anonymous).
+
+    **Error bodies.** Most JSON endpoints answer errors with `GenericResponse`
+    (`success: false`, `message`, optional `error`). A few endpoints use
+    `http.Error`, which returns a `text/plain` body; those are marked as such.
+  license:
+    name: GPL-3.0
+    identifier: GPL-3.0-only
+servers:
+  - url: http://localhost:8080
+    description: Default local server (`server.port` in config.yaml)
+
+tags:
+  - name: Auth
+    description: Login, logout and session information
+  - name: Documents
+    description: Create, read source, save, move and delete documents
+  - name: Versions
+    description: Document version history (editor or admin)
+  - name: Comments
+    description: Document comments
+  - name: Files
+    description: Document attachments
+  - name: Search
+    description: Full-text search
+  - name: Rendering
+    description: Markdown preview and helpers
+  - name: Settings
+    description: Wiki and security settings (admin)
+  - name: Users
+    description: User management (admin)
+  - name: Access rules
+    description: Path-based access rules (admin)
+  - name: Import
+    description: Import documents from a ZIP archive (admin)
+  - name: Backup
+    description: Backups of the data directory (admin)
+  - name: MCP
+    description: Model Context Protocol endpoint for agents
+  - name: Pages
+    description: HTML pages, sitemaps and static assets (non-JSON)
+
+security:
+  - sessionCookie: []
+  - bearerToken: []
+
+paths:
+  # ---------------------------------------------------------------- Auth
+  /api/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Log in and create a session
+      description: |
+        Validates the credentials and sets the `session_token` and `session_user`
+        cookies. Repeated failures from the same client IP can trigger a temporary
+        ban (see `/api/settings/security`), reported as `429` with a `Retry-After` header.
+
+        Note: requests with a method other than POST currently get the
+        `Method not allowed` JSON body with status `200`, because the handler
+        writes the body before the status code.
+      x-required-role: none
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Login successful; session cookies are set.
+          headers:
+            Set-Cookie:
+              description: "`session_token` (HttpOnly) and `session_user` cookies."
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: Invalid credentials.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "429":
+          description: The client IP is banned after too many failed logins.
+          headers:
+            Retry-After:
+              description: Seconds until the ban expires.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginBannedResponse"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Log out
+      description: Removes the session and clears the session cookies. Accepts any HTTP method.
+      x-required-role: none
+      security: []
+      responses:
+        "200":
+          description: Logged out.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+
+  /api/check-auth:
+    get:
+      tags: [Auth]
+      operationId: checkAuth
+      summary: Get the current session
+      x-required-role: viewer
+      responses:
+        "200":
+          description: The caller is authenticated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CheckAuthResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/check-default-password:
+    get:
+      tags: [Auth]
+      operationId: checkDefaultPassword
+      summary: Check whether the `admin` user still uses the default password
+      x-required-role: none
+      security: []
+      responses:
+        "200":
+          description: Result of the check.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [defaultPasswordInUse]
+                properties:
+                  defaultPasswordInUse:
+                    type: boolean
+
+  /api/password:
+    post:
+      tags: [Auth]
+      operationId: changeOwnPassword
+      summary: Change the current user's password
+      description: |
+        On success all sessions and personal access tokens of the user are
+        revoked and the session cookies are cleared, so the client must log in again.
+      x-required-role: viewer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PasswordChangeRequest"
+      responses:
+        "200":
+          description: Password changed; the user is logged out.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/GenericResponse"
+                  - type: object
+                    properties:
+                      logged_out:
+                        type: boolean
+                        const: true
+                      redirect:
+                        type: string
+                        example: /login
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: Not authenticated, or `current_password` does not match.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/tokens:
+    get:
+      tags: [Auth]
+      operationId: listTokens
+      summary: List the current user's personal access tokens
+      description: |
+        Returns the tokens without their secret. Requests authenticated with a
+        personal access token get `403`: tokens can only be managed from a login session.
+      x-required-role: viewer
+      responses:
+        "200":
+          description: The user's tokens.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  tokens:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TokenInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Auth]
+      operationId: createToken
+      summary: Create a personal access token
+      description: |
+        The plain token is returned only in this response; the server stores
+        only its SHA-256 hash in `config.yaml`. A user can hold up to 20 tokens.
+      x-required-role: viewer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenCreateRequest"
+      responses:
+        "201":
+          description: Token created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/GenericResponse"
+                  - type: object
+                    properties:
+                      token:
+                        type: string
+                        example: wgo_pat_Zm9vYmFy...
+                      details:
+                        $ref: "#/components/schemas/TokenInfo"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: |
+            The request used a personal access token, or `role` is above the user's role.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "409":
+          description: A token with that name exists, or the user has 20 tokens.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    delete:
+      tags: [Auth]
+      operationId: deleteToken
+      summary: Revoke a personal access token
+      x-required-role: viewer
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          $ref: "#/components/responses/Success"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  # ----------------------------------------------------------------- MCP
+  /mcp:
+    post:
+      tags: [MCP]
+      operationId: mcp
+      summary: Model Context Protocol endpoint (Streamable HTTP)
+      description: |
+        Receives one JSON-RPC 2.0 message per request and answers with a single
+        `application/json` response (stateless; no SSE stream and no
+        `Mcp-Session-Id`). Supported methods: `initialize`, `ping`, `tools/list`
+        and `tools/call`. Notifications get `202` with no body.
+
+        The caller is authenticated on every request with the same resolver as
+        the rest of the API; agents normally send a personal access token as
+        `Authorization: Bearer wgo_pat_...`. Every tool has a minimum role:
+        `tools/list` only returns the tools the caller's role (capped by the
+        token's `role`) may call, and calling another one returns a tool result
+        with `isError: true`. Tools apply the document access rules to their
+        own arguments and results. `initialize` returns `instructions` that
+        describe the workflow.
+
+        Document paths use `"guides/intro"` (leading and trailing slashes are
+        ignored); `""` or `"/"` is the home page.
+
+        `tools/list` returns, in order: `search_documents`, `list_documents`,
+        `read_document`, `edit_document`, `write_document`, `add_comment`,
+        `move_document`, `restore_version` and `delete_document`. A viewer
+        sees 4 tools; an editor or admin sees the 9.
+
+        Read-only tools (minimum role `viewer`):
+        - `search_documents`: `{"query": "deploy not draft", "limit": 10}`
+          runs the full-text search of `/api/search` and returns the path, title
+          and excerpt of up to `limit` matches (default 10, max 50). An empty
+          query is rejected.
+        - `list_documents`: `{"prefix": "guides", "depth": 2}` lists
+          `path — title` lines in tree order, including the home page when
+          `prefix` is empty. `depth` limits the levels below the prefix
+          (default 2, `0` for all); deeper documents are counted on their
+          ancestor as `+N below`. Results are capped at 500 entries.
+        - `read_document`: `{"path": "guides/intro", "include": ["comments"]}`
+          returns two text blocks: metadata (`path`, `revision`, a hash of the
+          current content, and the `include` sections `attachments`, `history`
+          and `comments`), then the Markdown source. `version` (a
+          `yyyymmddhhmmss` timestamp) reads an old version instead and omits
+          `revision`. `version` and the `history` section require `editor`,
+          like `/api/versions`. Missing and forbidden documents both return a
+          tool result with `isError: true` and the same message.
+
+        Write tools. They write through the same path as `/api/save` (versions,
+        atomic write and lock) and check the document `revision` from
+        `read_document` to detect concurrent changes. A stale revision returns
+        `Revision mismatch: the document changed since you read it; read it
+        again`, without the current revision. Missing and forbidden documents
+        return the same error, also when writing, and nothing is created on
+        disk before the access check passes. Each write is logged with the
+        user, token and path.
+        - `edit_document` (minimum role `editor`):
+          `{"path": "guides/intro", "revision": "9c1e4b7a2f0d3e55", "edits":
+          [{"old_text": "port 80", "new_text": "port 8080"}]}` applies 1 to 50
+          exact replacements in order and saves all or none. Without
+          `replace_all`, each `old_text` must match exactly once (byte by byte,
+          overlapping matches count). An edit that would leave the document
+          empty is rejected. Returns `Saved <path> (N edits applied).` plus
+          `revision` and, when one was stored, `previous version`.
+        - `write_document` (minimum role `editor`):
+          `{"path": "guides/deploy", "content": "# Deploy\n..."}` creates a
+          document and fails if it exists; with `revision` it replaces an
+          existing document. New paths must already be canonical (letters,
+          digits, `-`, `_` and `/`); otherwise the error suggests one. No
+          template is generated: the content brings its `#` title and front
+          matter. Identical content returns `Unchanged` with or without
+          `revision`, so a retry is idempotent.
+        - `add_comment` (minimum role `viewer`, like `/api/comments/add`):
+          `{"path": "guides/intro", "content": "Fixed the port"}` adds a
+          comment as the token owner. Fails when comments are disabled, when the
+          document has the `<!-- no comments -->` marker, or when the same user
+          already commented on the document in the same second.
+
+        Structure tools (minimum role `editor`). They share the write lock with
+        the other write tools and the API. Moving or deleting requires access
+        to every directory of the subtree; otherwise the error says that the
+        section contains documents the caller cannot access, without naming or
+        counting them. Their result lists the accessible documents (up to 20)
+        that link to the old path with an absolute Markdown link
+        (`](/guides/old)`), a wikilink with the path (`[[guides/old]]`), an
+        attachment URL (`/api/files/guides/old/...`) or, when the last segment
+        changes, a wikilink by name (`[[old]]`), outside code blocks; relative
+        links are not detected. The home page cannot be moved, deleted or used
+        as a target.
+        - `move_document`:
+          `{"path": "guides/old-name", "new_path": "archive/new-name"}` moves the
+          document with its sub-documents, attachments, versions and comments;
+          if the versions or comments cannot be moved, nothing moves.
+          `new_path` must be canonical (letters, digits, `-`, `_` and `/`) and
+          accessible, like its parent, before the tool reveals whether it is
+          taken. When any moved document would fall under a different access
+          rule, the move fails with up to 3 examples (`finance/report:
+          restricted (/finance/**) → public`) unless `allow_access_change` is
+          `true`; this also applies to admins. Returns `Moved <path> →
+          <new_path> (N documents).` and the documents that link to the old path.
+        - `restore_version`:
+          `{"path": "guides/intro", "version": "20261022101500", "revision":
+          "9c1e4b7a2f0d3e55"}` saves the version as the current content through
+          the write path of `edit_document`: the current content is kept as a
+          new version and a stale `revision` is a mismatch. When the content is
+          already the version's, it returns `Unchanged` whatever the revision,
+          so a retry is idempotent. Returns `Restored <path> to version <ts>.`,
+          the new `revision` and the `previous version`.
+        - `delete_document`:
+          `{"path": "guides/obsolete", "revision": "9c1e4b7a2f0d3e55"}`
+          permanently deletes the document with its attachments, versions and
+          comments. `revision` is required when the path has a `document.md`
+          (a folder without one has no revision). A document with
+          sub-documents is only deleted with `"recursive": true`; otherwise the
+          error counts them. Returns `Deleted <path> (N sub-documents, M
+          attachments).`, the documents that linked to it and, if the versions
+          or comments could not be removed, `warnings`.
+
+        Requests with an `Origin` header that does not match the host get `403`.
+        An unsupported `MCP-Protocol-Version` header gets `400`. A message
+        larger than 1 MiB (with the content escaped in JSON) gets `413`.
+      x-required-role: viewer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [jsonrpc, method]
+              properties:
+                jsonrpc:
+                  type: string
+                  const: "2.0"
+                id:
+                  type: [string, integer]
+                method:
+                  type: string
+                  example: tools/call
+                params:
+                  type: object
+            example:
+              jsonrpc: "2.0"
+              id: 1
+              method: tools/call
+              params:
+                name: read_document
+                arguments:
+                  path: guides/intro
+      responses:
+        "200":
+          description: JSON-RPC response with `result` or `error`.
+          content:
+            application/json:
+              schema:
+                type: object
+        "202":
+          description: Notification accepted.
+        "400":
+          description: Unsupported `MCP-Protocol-Version` header.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "401":
+          description: "No valid credential; includes a `WWW-Authenticate: Bearer` challenge."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "403":
+          description: Cross-origin request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "413":
+          description: |
+            The message is larger than 1 MiB. The body did not arrive whole, so
+            the answer is not a JSON-RPC response: `{"success": false,
+            "message": "Request too large (limit 1 MiB)"}`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+
+  # ----------------------------------------------------------- Documents
+  /api/document/create:
+    post:
+      tags: [Documents]
+      operationId: createDocument
+      summary: Create a new document
+      description: |
+        Creates `<path>/document.md` with an initial template that depends on `type`.
+      x-required-role: editor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDocumentRequest"
+      responses:
+        "200":
+          description: Document created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateDocumentResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          description: A document already exists at that path.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/document/move:
+    post:
+      tags: [Documents]
+      operationId: moveDocument
+      summary: Move and/or rename a document or category
+      description: |
+        Moves the document directory together with its versions and comments.
+        Provide `targetPath`, `newSlug`, or both. The home page cannot be moved.
+        The user needs access to every directory of the moved subtree, at its
+        current and new path, and to the target and its parent; otherwise `403`.
+        If the versions or comments cannot be moved, the move is undone and
+        the response is `500`. A target directory that exists must be empty; a
+        rename that only changes the case of the name is allowed. Shares the
+        write lock with `/api/save` and the MCP tools, and refreshes the index
+        that resolves `[[name]]` wikilinks.
+      x-required-role: editor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MoveRequest"
+      responses:
+        "200":
+          description: Document moved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MoveResponse"
+        "400":
+          description: Invalid request or paths, including a target inside the source.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MoveResponse"
+        "403":
+          description: The source, the target or a directory of the moved subtree is not accessible.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MoveResponse"
+        "404":
+          description: Source document or category not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MoveResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          description: The target already exists and is not an empty directory.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MoveResponse"
+        "500":
+          description: The move failed; nothing was moved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MoveResponse"
+
+  /api/document/{docPath}:
+    parameters:
+      - $ref: "#/components/parameters/DocPath"
+    get:
+      tags: [Documents]
+      operationId: getDocument
+      summary: Placeholder (not implemented)
+      description: Echoes the requested path. Document retrieval is not implemented; use `/api/source/{docPath}`.
+      deprecated: true
+      x-required-role: none
+      security: []
+      responses:
+        "200":
+          description: Placeholder response.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  path:
+                    type: string
+                    example: /finance/finance-report
+                  message:
+                    type: string
+                    example: Document retrieval not yet implemented
+    delete:
+      tags: [Documents]
+      operationId: deleteDocument
+      summary: Delete a document and its children
+      description: |
+        Recursively deletes the document directory (including sub-documents and
+        attachments) and its versions and comments. The home page cannot be deleted.
+        Deleting a directory requires access to every directory below it;
+        otherwise the response is `403` and nothing is deleted. Shares the
+        write lock with `/api/save` and the MCP tools, and refreshes the index
+        that resolves `[[name]]` wikilinks.
+      x-required-role: editor
+      responses:
+        "200":
+          $ref: "#/components/responses/Success"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/source/{docPath}:
+    parameters:
+      - $ref: "#/components/parameters/DocPathOrHome"
+    get:
+      tags: [Documents]
+      operationId: getDocumentSource
+      summary: Get the raw Markdown of a document
+      description: |
+        Returns the content of `document.md`. If the directory exists but has no
+        `document.md`, a default `# <Title>` template is returned. Use `/api/source/`
+        (empty path) for the home page.
+      x-required-role: editor
+      responses:
+        "200":
+          description: Raw Markdown.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: no-cache, no-store, must-revalidate
+          content:
+            text/plain:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/save/{docPath}:
+    parameters:
+      - $ref: "#/components/parameters/DocPathOrHome"
+    post:
+      tags: [Documents]
+      operationId: saveDocument
+      summary: Save the raw Markdown of a document
+      description: |
+        Overwrites `document.md` with the request body, creating the directory if
+        needed. The write is atomic (temporary file and rename) and shares its
+        lock with the MCP write tools. When `max_versions > 0` the previous
+        content is stored as a version; if a version of the same second exists,
+        it is kept and no new one is stored. Saving identical content writes
+        nothing and stores no version. There is no concurrency check: the
+        request does not carry a revision. Use `/api/save/` (empty path) for the
+        home page.
+      x-required-role: editor
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+              description: Full Markdown content of the document.
+      responses:
+        "200":
+          $ref: "#/components/responses/Success"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/documents/list:
+    get:
+      tags: [Documents]
+      operationId: listDocuments
+      summary: List the documents the user can access
+      description: Used by the editor for document linking. The home page is not included.
+      x-required-role: editor
+      responses:
+        "200":
+          description: Documents found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/folders:
+    get:
+      tags: [Documents]
+      operationId: listFolders
+      summary: List all folders of the documents tree
+      description: Used by the access rules editor. The first entry is always the home page (`/`).
+      x-required-role: admin
+      responses:
+        "200":
+          description: Folders found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  folders:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/FolderInfo"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  # ------------------------------------------------------------ Versions
+  /api/versions/{docPath}:
+    parameters:
+      - $ref: "#/components/parameters/VersionDocPath"
+    get:
+      tags: [Versions]
+      operationId: listVersions
+      summary: List the versions of a document
+      description: Versions are sorted newest first.
+      x-required-role: editor
+      responses:
+        "200":
+          description: Version list (empty with a message when there are none).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VersionsListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/versions/{docPath}/{timestamp}:
+    parameters:
+      - $ref: "#/components/parameters/VersionDocPath"
+      - $ref: "#/components/parameters/VersionTimestamp"
+    get:
+      tags: [Versions]
+      operationId: getVersion
+      summary: Get the content of a version
+      x-required-role: editor
+      responses:
+        "200":
+          description: Version content.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VersionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/versions/{docPath}/{timestamp}/restore:
+    parameters:
+      - $ref: "#/components/parameters/VersionDocPath"
+      - $ref: "#/components/parameters/VersionTimestamp"
+    post:
+      tags: [Versions]
+      operationId: restoreVersion
+      summary: Restore a version
+      description: |
+        Replaces the current document with the version, through the write path
+        of `/api/save`: when `max_versions > 0` the current content is saved as
+        a new version first (the first version of a second is kept), the write
+        is atomic, and restoring content identical to the current one writes
+        nothing and creates no version.
+      x-required-role: editor
+      responses:
+        "200":
+          $ref: "#/components/responses/Success"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  # ------------------------------------------------------------ Comments
+  /api/comments/{docPath}:
+    parameters:
+      - $ref: "#/components/parameters/DocPath"
+    get:
+      tags: [Comments]
+      operationId: listComments
+      summary: List the comments of a document
+      description: |
+        Returns an empty list when comments are disabled wiki-wide. Anonymous
+        callers can read comments of documents they are allowed to see.
+      x-required-role: none
+      security:
+        - {}
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Comments, oldest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  comments:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Comment"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/comments/add/{docPath}:
+    parameters:
+      - $ref: "#/components/parameters/DocPath"
+    post:
+      tags: [Comments]
+      operationId: addComment
+      summary: Add a comment to a document
+      description: |
+        Fails with `403` when comments are disabled wiki-wide or by the
+        document's front matter. Comment IDs are `<yyyymmddhhmmss>_<user>.md`,
+        so a second comment by the same user on the same document in the same
+        second gets `409` and the first one is kept.
+      x-required-role: viewer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommentRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/Success"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          description: The user already commented on this document in the same second; retry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/comments/delete/{docPath}/{commentId}:
+    parameters:
+      - $ref: "#/components/parameters/DocPath"
+      - name: commentId
+        in: path
+        required: true
+        description: Comment ID as returned in `Comment.ID`.
+        schema:
+          type: string
+    delete:
+      tags: [Comments]
+      operationId: deleteComment
+      summary: Delete a comment
+      x-required-role: admin
+      responses:
+        "200":
+          $ref: "#/components/responses/Success"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  # --------------------------------------------------------------- Files
+  /api/files/upload:
+    post:
+      tags: [Files]
+      operationId: uploadFile
+      summary: Upload an attachment to a document
+      description: |
+        The file extension must be in the allowed list (see `/static/js/file-extensions.js`)
+        and, unless `disable_file_upload_checking` is set, the content must match
+        the extension. SVG files are sanitized before being stored. The size limit
+        is `max_upload_size` (MB).
+      x-required-role: editor
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, docPath]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                docPath:
+                  type: string
+                  description: Document that receives the file. Use `/` for the home page.
+                  example: finance/finance-report
+      responses:
+        "200":
+          description: File uploaded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileResponse"
+        "400":
+          description: Invalid form, path, extension or content.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileResponse"
+        "401":
+          $ref: "#/components/responses/FileUnauthorized"
+        "403":
+          $ref: "#/components/responses/FileForbidden"
+        "405":
+          $ref: "#/components/responses/FileMethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/FileServerError"
+
+  /api/files/list/{docPath}:
+    parameters:
+      - name: docPath
+        in: path
+        required: true
+        description: Document path (multi-segment). Use `pages/home` for the home page.
+        schema:
+          type: string
+          example: finance/finance-report
+    get:
+      tags: [Files]
+      operationId: listFiles
+      summary: List the attachments of a document
+      x-required-role: none
+      security:
+        - {}
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Files found (`document.md` is excluded).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileResponse"
+        "400":
+          description: Invalid path.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileResponse"
+        "401":
+          $ref: "#/components/responses/FileUnauthorized"
+        "404":
+          description: Document directory does not exist.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileResponse"
+        "405":
+          $ref: "#/components/responses/FileMethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/FileServerError"
+
+  /api/files/delete/{filePath}:
+    parameters:
+      - $ref: "#/components/parameters/FilePath"
+    delete:
+      tags: [Files]
+      operationId: deleteFile
+      summary: Delete an attachment
+      description: "`document.md` itself cannot be deleted."
+      x-required-role: editor
+      responses:
+        "200":
+          description: File deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileResponse"
+        "400":
+          description: Invalid path, path is a directory, or target is `document.md`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileResponse"
+        "401":
+          $ref: "#/components/responses/FileUnauthorized"
+        "403":
+          $ref: "#/components/responses/FileForbidden"
+        "404":
+          description: File not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileResponse"
+        "405":
+          $ref: "#/components/responses/FileMethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/FileServerError"
+
+  /api/files/rename:
+    post:
+      tags: [Files]
+      operationId: renameFile
+      summary: Rename an attachment
+      x-required-role: editor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RenameFileRequest"
+      responses:
+        "200":
+          description: File renamed (or already had that name).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileResponse"
+        "400":
+          description: Invalid request, path or new name.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileResponse"
+        "401":
+          $ref: "#/components/responses/FileUnauthorized"
+        "403":
+          $ref: "#/components/responses/FileForbidden"
+        "404":
+          description: File not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileResponse"
+        "405":
+          $ref: "#/components/responses/FileMethodNotAllowed"
+        "409":
+          description: A file with the new name already exists.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileResponse"
+        "500":
+          $ref: "#/components/responses/FileServerError"
+
+  /api/files/{filePath}:
+    parameters:
+      - $ref: "#/components/parameters/FilePath"
+    get:
+      tags: [Files]
+      operationId: getFile
+      summary: Download an attachment
+      description: |
+        Serves the file with the MIME type of its extension. JPEG, PNG, GIF and
+        plain text are served inline; every other type gets
+        `Content-Disposition: attachment`. SVG files are sanitized on the fly.
+        Files whose content does not match their extension are reported as `404`.
+        Errors are plain text.
+      x-required-role: none
+      security:
+        - {}
+        - sessionCookie: []
+      responses:
+        "200":
+          description: File content.
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/PlainBadRequest"
+        "401":
+          $ref: "#/components/responses/PlainUnauthorized"
+        "404":
+          $ref: "#/components/responses/PlainNotFound"
+        "405":
+          $ref: "#/components/responses/PlainMethodNotAllowed"
+
+  # -------------------------------------------------------------- Search
+  /api/search:
+    post:
+      tags: [Search]
+      operationId: search
+      summary: Full-text search in documents
+      description: |
+        Query syntax: words are ANDed, `"exact phrase"` matches a phrase and
+        `not word` excludes a word. Only documents the caller can access are
+        returned. When nothing matches the body is `null`. Errors are plain text.
+      x-required-role: none
+      security:
+        - {}
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query:
+                  type: string
+                  example: 'report "quarterly results" not draft'
+      responses:
+        "200":
+          description: Matching documents.
+          content:
+            application/json:
+              schema:
+                type: [array, "null"]
+                items:
+                  $ref: "#/components/schemas/SearchResult"
+        "400":
+          $ref: "#/components/responses/PlainBadRequest"
+        "405":
+          $ref: "#/components/responses/PlainMethodNotAllowed"
+
+  # ----------------------------------------------------------- Rendering
+  /api/render-markdown:
+    post:
+      tags: [Rendering]
+      operationId: renderMarkdown
+      summary: Render Markdown to HTML
+      description: Used by the editor preview so that it matches server-side rendering. Errors are plain text.
+      x-required-role: viewer
+      parameters:
+        - name: path
+          in: query
+          required: false
+          description: Document path, used to resolve relative links and attachments.
+          schema:
+            type: string
+        - name: source_lines
+          in: query
+          required: false
+          description: When `1`, annotate the output with source line numbers (used for scroll sync).
+          schema:
+            type: string
+            enum: ["1"]
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+      responses:
+        "200":
+          description: Rendered HTML fragment.
+          content:
+            text/html:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/PlainUnauthorized"
+        "405":
+          $ref: "#/components/responses/PlainMethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/PlainServerError"
+
+  /api/utils/slugify:
+    post:
+      tags: [Rendering]
+      operationId: slugify
+      summary: Convert text into a URL-friendly ASCII slug
+      x-required-role: none
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:
+                  type: string
+                  example: Información Financiera
+                lang:
+                  type: string
+                  description: Optional language code that tunes the transliteration.
+                  example: es
+      responses:
+        "200":
+          description: Generated slug.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  slug:
+                    type: string
+                    example: informacion-financiera
+        "400":
+          description: Invalid request body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+        "405":
+          description: Method not allowed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+
+  /api/links/fetch-metadata:
+    post:
+      tags: [Rendering]
+      operationId: fetchLinkMetadata
+      summary: Fetch the title and description of an external URL
+      description: |
+        Used by the links layout. Destinations that resolve to private, loopback
+        or otherwise disallowed addresses are rejected.
+      x-required-role: editor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  format: uri
+                  example: https://example.com
+      responses:
+        "200":
+          description: Metadata found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataResponse"
+        "400":
+          description: Invalid body, missing URL or disallowed destination.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "405":
+          $ref: "#/components/responses/PlainMethodNotAllowed"
+        "502":
+          description: The remote page could not be fetched.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataResponse"
+
+  /api/data/emojis:
+    get:
+      tags: [Rendering]
+      operationId: getEmojis
+      summary: Emoji data used by the editor
+      x-required-role: none
+      security: []
+      responses:
+        "200":
+          description: Contents of `emojis.json`. Cached for one day.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "500":
+          $ref: "#/components/responses/PlainServerError"
+
+  # ------------------------------------------------------------ Settings
+  /api/settings/wiki:
+    get:
+      tags: [Settings]
+      operationId: getWikiSettings
+      summary: Get the wiki settings
+      x-required-role: admin
+      responses:
+        "200":
+          description: Current settings.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WikiSettingsResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Settings]
+      operationId: updateWikiSettings
+      summary: Update the wiki settings
+      description: |
+        Replaces all the fields (send the full object). `title`, `owner`, `notice`
+        and `timezone` are required and `timezone` must be a valid IANA zone.
+        The configuration file is rewritten.
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WikiSettings"
+      responses:
+        "200":
+          $ref: "#/components/responses/Success"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/settings/security:
+    get:
+      tags: [Settings]
+      operationId: getSecuritySettings
+      summary: Get the security settings
+      x-required-role: admin
+      responses:
+        "200":
+          description: Current settings.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecuritySettings"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Settings]
+      operationId: updateSecuritySettings
+      summary: Update the security settings
+      description: |
+        Also accepted as `PUT`. All `login_ban` values must be positive and
+        `max_ban_seconds >= initial_ban_seconds`. The ban list is reinitialised.
+        Validation errors are plain text. The response echoes the request.
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SecuritySettings"
+      responses:
+        "200":
+          description: Updated settings.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecuritySettings"
+        "400":
+          $ref: "#/components/responses/PlainBadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    put:
+      tags: [Settings]
+      operationId: replaceSecuritySettings
+      summary: Update the security settings (alias of POST)
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SecuritySettings"
+      responses:
+        "200":
+          description: Updated settings.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecuritySettings"
+        "400":
+          $ref: "#/components/responses/PlainBadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  # --------------------------------------------------------------- Users
+  /api/users:
+    get:
+      tags: [Users]
+      operationId: listUsers
+      summary: List users (without passwords)
+      x-required-role: admin
+      responses:
+        "200":
+          description: User list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  users:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/User"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Users]
+      operationId: createUser
+      summary: Create a user
+      description: An invalid or empty `role` falls back to `viewer`.
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UserCreateRequest"
+      responses:
+        "201":
+          $ref: "#/components/responses/Success"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Username already exists.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    put:
+      tags: [Users]
+      operationId: updateUser
+      summary: Update a user's role, groups or password
+      description: |
+        `role` and `groups` are always replaced. An invalid or empty `role` falls
+        back to `viewer`. The user's sessions are revoked when the role is
+        lowered, the groups change or a new password is set; `logged_out` is
+        `true` when that affected the caller.
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UserUpdateRequest"
+      responses:
+        "200":
+          description: User updated.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/GenericResponse"
+                  - type: object
+                    properties:
+                      logged_out:
+                        type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    delete:
+      tags: [Users]
+      operationId: deleteUser
+      summary: Delete a user
+      description: You cannot delete your own account or the last admin.
+      x-required-role: admin
+      parameters:
+        - name: username
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          $ref: "#/components/responses/Success"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  # -------------------------------------------------------- Access rules
+  /api/access-rules:
+    get:
+      tags: [Access rules]
+      operationId: listAccessRules
+      summary: List the access rules in evaluation order
+      x-required-role: admin
+      responses:
+        "200":
+          description: Rules.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rules:
+                    type: [array, "null"]
+                    items:
+                      $ref: "#/components/schemas/AccessRule"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Access rules]
+      operationId: createAccessRule
+      summary: Append an access rule
+      description: "`pattern` is required and `/**` is not allowed."
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccessRule"
+      responses:
+        "201":
+          $ref: "#/components/responses/AccessRuleResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/access-rules/reorder:
+    post:
+      tags: [Access rules]
+      operationId: reorderAccessRules
+      summary: Reorder the access rules
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [indices]
+              properties:
+                indices:
+                  type: array
+                  description: |
+                    Current indices in the desired new order. Must contain exactly
+                    one entry per existing rule.
+                  items:
+                    type: integer
+                    minimum: 0
+                  example: [2, 0, 1]
+      responses:
+        "200":
+          description: Rules reordered.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/GenericResponse"
+                  - type: object
+                    properties:
+                      rules:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/AccessRule"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/access-rules/{index}:
+    parameters:
+      - name: index
+        in: path
+        required: true
+        description: Zero-based position of the rule in the list.
+        schema:
+          type: integer
+          minimum: 0
+    put:
+      tags: [Access rules]
+      operationId: updateAccessRule
+      summary: Replace an access rule
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccessRule"
+      responses:
+        "200":
+          $ref: "#/components/responses/AccessRuleResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    delete:
+      tags: [Access rules]
+      operationId: deleteAccessRule
+      summary: Delete an access rule
+      x-required-role: admin
+      responses:
+        "200":
+          $ref: "#/components/responses/Success"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  # -------------------------------------------------------------- Import
+  /api/import:
+    post:
+      tags: [Import]
+      operationId: startImport
+      summary: Import Markdown documents from a ZIP archive
+      description: |
+        Starts a background job and returns its ID. Poll `statusUrl` for progress.
+        The size limit is `max_upload_size` (MB).
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [zipFile]
+              properties:
+                zipFile:
+                  type: string
+                  format: binary
+                  description: ZIP archive containing `.md` files.
+      responses:
+        "200":
+          description: Import started.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportResponse"
+        "400":
+          description: Invalid form or file is not a ZIP.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportResponse"
+        "401":
+          description: Admin access required.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportResponse"
+        "405":
+          description: Method not allowed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportResponse"
+        "500":
+          description: Server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportResponse"
+
+  /api/import/status/{jobId}:
+    parameters:
+      - name: jobId
+        in: path
+        required: true
+        schema:
+          type: string
+          example: import-1729600000000000000
+    get:
+      tags: [Import]
+      operationId: getImportStatus
+      summary: Get the progress of an import job
+      description: Jobs are kept in memory and are lost when the server restarts.
+      x-required-role: admin
+      responses:
+        "200":
+          description: Job status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportStatus"
+        "401":
+          description: Admin access required.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportResponse"
+        "404":
+          description: Import job not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportResponse"
+        "405":
+          description: Method not allowed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportResponse"
+
+  # -------------------------------------------------------------- Backup
+  /api/backup/start:
+    post:
+      tags: [Backup]
+      operationId: startBackup
+      summary: Start a backup of the data directory
+      description: |
+        Starts a background job that zips the wiki root directory into
+        `backups/backup_<yyyymmddhhmmss>.zip`. Accepts any HTTP method.
+      x-required-role: admin
+      responses:
+        "200":
+          description: Backup started.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobId:
+                    type: string
+                  statusUrl:
+                    type: string
+                    example: /api/backup/status/1729600000000000000
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/PlainServerError"
+
+  /api/backup/status/{jobId}:
+    parameters:
+      - name: jobId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [Backup]
+      operationId: getBackupStatus
+      summary: Get the progress of a backup job
+      description: Jobs are kept in memory and are lost when the server restarts.
+      x-required-role: admin
+      responses:
+        "200":
+          description: Job status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackupJob"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/PlainNotFound"
+
+  /api/backup/list:
+    get:
+      tags: [Backup]
+      operationId: listBackups
+      summary: List the available backups (newest first)
+      x-required-role: admin
+      responses:
+        "200":
+          description: Backups.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  backups:
+                    type: [array, "null"]
+                    items:
+                      $ref: "#/components/schemas/BackupFile"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/PlainServerError"
+
+  /api/backup/download/{filename}:
+    parameters:
+      - $ref: "#/components/parameters/BackupFilename"
+    get:
+      tags: [Backup]
+      operationId: downloadBackup
+      summary: Download a backup
+      x-required-role: admin
+      responses:
+        "200":
+          description: ZIP archive.
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: attachment; filename=backup_20261022101500.zip
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/PlainBadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/PlainNotFound"
+
+  /api/backup/delete/{filename}:
+    parameters:
+      - $ref: "#/components/parameters/BackupFilename"
+    delete:
+      tags: [Backup]
+      operationId: deleteBackup
+      summary: Delete a backup
+      description: Accepts any HTTP method; `DELETE` is the intended one.
+      x-required-role: admin
+      responses:
+        "200":
+          description: Backup deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    const: true
+        "400":
+          $ref: "#/components/responses/PlainBadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/PlainNotFound"
+        "500":
+          $ref: "#/components/responses/PlainServerError"
+
+  # --------------------------------------------------- Pages and assets
+  /:
+    get:
+      tags: [Pages]
+      operationId: homePage
+      summary: Home page (HTML)
+      description: |
+        Redirects to `/login?redirect=...` when the wiki or the page is private
+        and the caller has no access.
+      x-required-role: none
+      security:
+        - {}
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/PageMode"
+      responses:
+        "200":
+          $ref: "#/components/responses/Html"
+        "303":
+          $ref: "#/components/responses/LoginRedirect"
+
+  /{pagePath}:
+    parameters:
+      - name: pagePath
+        in: path
+        required: true
+        description: Document path (multi-segment), e.g. `finance/finance-report`.
+        schema:
+          type: string
+    get:
+      tags: [Pages]
+      operationId: documentPage
+      summary: Document page (HTML)
+      description: |
+        Catch-all route for every path not matched by another route. Renders the
+        document, or the 404 page when it does not exist.
+      x-required-role: none
+      security:
+        - {}
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/PageMode"
+      responses:
+        "200":
+          $ref: "#/components/responses/Html"
+        "303":
+          $ref: "#/components/responses/LoginRedirect"
+        "404":
+          $ref: "#/components/responses/Html"
+
+  /login:
+    get:
+      tags: [Pages]
+      operationId: loginPage
+      summary: Login page (HTML)
+      description: Redirects to `/` when the caller is already logged in.
+      x-required-role: none
+      security: []
+      parameters:
+        - name: redirect
+          in: query
+          required: false
+          description: Path to return to after a successful login.
+          schema:
+            type: string
+      responses:
+        "200":
+          $ref: "#/components/responses/Html"
+        "303":
+          description: Already logged in; redirect to `/`.
+
+  /sitemap/:
+    get:
+      tags: [Pages]
+      operationId: htmlSitemap
+      summary: Human-readable sitemap (HTML)
+      description: Lists only the pages the caller can access.
+      x-required-role: none
+      security:
+        - {}
+        - sessionCookie: []
+      responses:
+        "200":
+          $ref: "#/components/responses/Html"
+        "500":
+          $ref: "#/components/responses/PlainServerError"
+
+  /sitemap.xml:
+    get:
+      tags: [Pages]
+      operationId: xmlSitemap
+      summary: XML sitemap for search engines
+      description: Lists only the pages the caller can access. Cached for one day.
+      x-required-role: none
+      security: []
+      responses:
+        "200":
+          description: Sitemap in the sitemaps.org 0.9 format.
+          content:
+            application/xml:
+              schema:
+                type: string
+        "500":
+          $ref: "#/components/responses/PlainServerError"
+
+  /manifest.json:
+    get:
+      tags: [Pages]
+      operationId: webManifest
+      summary: PWA web manifest
+      description: Uses `<root>/static/manifest.json` if present; otherwise the embedded one with `name` set to the wiki title.
+      x-required-role: none
+      security: []
+      responses:
+        "200":
+          description: Web manifest.
+          content:
+            application/manifest+json:
+              schema:
+                type: object
+                additionalProperties: true
+        "404":
+          $ref: "#/components/responses/PlainNotFound"
+
+  /static/{assetPath}:
+    parameters:
+      - name: assetPath
+        in: path
+        required: true
+        description: |
+          Asset path (multi-segment). Files in `<root>/static/` override the
+          embedded ones. `js/file-extensions.js` is generated dynamically with the
+          allowed upload extensions and their MIME types.
+        schema:
+          type: string
+          example: css/theme.css
+    get:
+      tags: [Pages]
+      operationId: staticAsset
+      summary: Static assets (CSS, JS, fonts, images)
+      x-required-role: none
+      security: []
+      responses:
+        "200":
+          description: Asset content.
+          content:
+            "*/*":
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/PlainNotFound"
+
+  /favicon.{format}:
+    parameters:
+      - name: format
+        in: path
+        required: true
+        schema:
+          type: string
+          enum: [ico, png, svg]
+    get:
+      tags: [Pages]
+      operationId: favicon
+      summary: Favicon
+      description: |
+        Served from `<root>/static/` when any custom favicon exists (`404` for
+        formats not provided), otherwise the embedded favicon.
+      x-required-role: none
+      security: []
+      responses:
+        "200":
+          description: Favicon image.
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/PlainNotFound"
+
+  /logo.png:
+    get:
+      tags: [Pages]
+      operationId: logo
+      summary: Wiki logo
+      x-required-role: none
+      security: []
+      responses:
+        "200":
+          description: Logo image (custom `<root>/static/logo.png` or embedded).
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: session_token
+      description: Session token set by `POST /api/login`.
+    bearerToken:
+      type: http
+      scheme: bearer
+      description: |
+        A session token, or a personal access token created with
+        `POST /api/tokens` (prefix `wgo_pat_`).
+
+  parameters:
+    DocPath:
+      name: docPath
+      in: path
+      required: true
+      description: |
+        Document path without leading slash (multi-segment, may contain `/`).
+        Use an empty string or `/` for the home page where the endpoint allows it.
+      schema:
+        type: string
+        example: finance/finance-report
+    DocPathOrHome:
+      name: docPath
+      in: path
+      required: true
+      description: |
+        Document path (multi-segment). An empty value (`/api/source/`,
+        `/api/save/`) addresses the home page.
+      schema:
+        type: string
+        example: finance/finance-report
+    VersionDocPath:
+      name: docPath
+      in: path
+      required: true
+      description: Document path (multi-segment). Use `pages/home` for the home page.
+      schema:
+        type: string
+        example: finance/finance-report
+    VersionTimestamp:
+      name: timestamp
+      in: path
+      required: true
+      description: Version timestamp, `yyyymmddhhmmss`.
+      schema:
+        type: string
+        pattern: "^[0-9]{14}$"
+        example: "20261022101500"
+    FilePath:
+      name: filePath
+      in: path
+      required: true
+      description: |
+        Attachment path: document path followed by the file name (multi-segment).
+        Home page attachments live under `pages/home/`.
+      schema:
+        type: string
+        example: finance/finance-report/chart.png
+    BackupFilename:
+      name: filename
+      in: path
+      required: true
+      description: Backup file name as returned by `/api/backup/list`.
+      schema:
+        type: string
+        example: backup_20261022101500.zip
+    PageMode:
+      name: mode
+      in: query
+      required: false
+      description: "`edit` opens the editor (editor or admin; others are redirected to view mode)."
+      schema:
+        type: string
+        enum: [edit]
+
+  responses:
+    Success:
+      description: Operation succeeded.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GenericResponse"
+    BadRequest:
+      description: Invalid request body or parameters.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GenericResponse"
+    Unauthorized:
+      description: Not authenticated, or the role is not sufficient.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GenericResponse"
+    Forbidden:
+      description: The role or the document access rules do not allow the operation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GenericResponse"
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GenericResponse"
+    MethodNotAllowed:
+      description: Method not allowed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GenericResponse"
+    ServerError:
+      description: Server error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GenericResponse"
+    FileUnauthorized:
+      description: Not authenticated, or the role is not sufficient.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/FileResponse"
+    FileForbidden:
+      description: Document access denied.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/FileResponse"
+    FileMethodNotAllowed:
+      description: Method not allowed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/FileResponse"
+    FileServerError:
+      description: Server error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/FileResponse"
+    PlainBadRequest:
+      description: Invalid request.
+      content:
+        text/plain:
+          schema:
+            type: string
+    PlainUnauthorized:
+      description: Unauthorized.
+      content:
+        text/plain:
+          schema:
+            type: string
+    PlainNotFound:
+      description: Not found.
+      content:
+        text/plain:
+          schema:
+            type: string
+    PlainMethodNotAllowed:
+      description: Method not allowed.
+      content:
+        text/plain:
+          schema:
+            type: string
+    PlainServerError:
+      description: Server error.
+      content:
+        text/plain:
+          schema:
+            type: string
+    AccessRuleResult:
+      description: Rule saved.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/GenericResponse"
+              - type: object
+                properties:
+                  rule:
+                    $ref: "#/components/schemas/AccessRule"
+    Html:
+      description: HTML page.
+      content:
+        text/html:
+          schema:
+            type: string
+    LoginRedirect:
+      description: Access denied; redirect to the login page.
+      headers:
+        Location:
+          schema:
+            type: string
+            example: /login?redirect=%2Ffinance
+
+  schemas:
+    GenericResponse:
+      type: object
+      required: [success]
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        error:
+          type: string
+          description: Optional technical detail.
+    SimpleError:
+      type: object
+      properties:
+        error:
+          type: string
+
+    Role:
+      type: string
+      enum: [admin, editor, viewer]
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+          format: password
+        keepLoggedIn:
+          type: boolean
+          description: Use a long-lived session cookie.
+          default: false
+    LoginBannedResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          const: false
+        retryAfter:
+          type: integer
+          description: Seconds until the ban expires.
+        message:
+          type: string
+    CheckAuthResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        username:
+          type: string
+        role:
+          $ref: "#/components/schemas/Role"
+        groups:
+          type: [array, "null"]
+          items:
+            type: string
+    PasswordChangeRequest:
+      type: object
+      required: [current_password, new_password]
+      properties:
+        current_password:
+          type: string
+          format: password
+        new_password:
+          type: string
+          format: password
+
+    CreateDocumentRequest:
+      type: object
+      required: [title, path]
+      properties:
+        title:
+          type: string
+          example: Finance report
+        path:
+          type: string
+          description: Document path; it is sanitized before use.
+          example: finance/finance-report
+        type:
+          type: string
+          description: Initial template. Anything else than `kanban` or `links` creates a plain Markdown document.
+          enum: [markdown, kanban, links]
+          default: markdown
+    CreateDocumentResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        url:
+          type: string
+          example: /finance/finance-report
+        message:
+          type: string
+    MoveRequest:
+      type: object
+      required: [sourcePath]
+      properties:
+        sourcePath:
+          type: string
+          description: Current document path.
+          example: finance/finance-report
+        targetPath:
+          type: string
+          description: Destination parent path. Empty with a `newSlug` moves to the root.
+          example: internal
+        newSlug:
+          type: string
+          description: New last path segment (rename).
+          example: report-2026
+    MoveResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        newPath:
+          type: string
+        oldPath:
+          type: string
+    Document:
+      type: object
+      properties:
+        title:
+          type: string
+        path:
+          type: string
+          example: /finance/finance-report
+    DocumentsResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        documents:
+          type: [array, "null"]
+          items:
+            $ref: "#/components/schemas/Document"
+    FolderInfo:
+      type: object
+      properties:
+        path:
+          type: string
+          example: /finance
+        name:
+          type: string
+        level:
+          type: integer
+          description: Depth in the tree; top-level folders are 0.
+
+    VersionInfo:
+      type: object
+      properties:
+        timestamp:
+          type: string
+          example: "20261022101500"
+        path:
+          type: string
+          example: finance/finance-report/20261022101500
+    VersionsListResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        versions:
+          type: [array, "null"]
+          items:
+            $ref: "#/components/schemas/VersionInfo"
+        message:
+          type: string
+    VersionResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        content:
+          type: string
+          description: Markdown content of the version.
+        message:
+          type: string
+
+    CommentRequest:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: string
+          description: Comment in Markdown; must not be blank.
+    Comment:
+      type: object
+      description: Field names are capitalized because the Go struct has no JSON tags.
+      properties:
+        ID:
+          type: string
+          description: "`{timestamp}_{username}.md`"
+        Author:
+          type: string
+        Timestamp:
+          type: string
+          description: "`yyyymmddhhmmss`"
+        TimestampUnix:
+          type: integer
+          format: int64
+        Content:
+          type: string
+          description: Raw Markdown.
+        RenderedHTML:
+          type: string
+          description: Content rendered to HTML.
+        FormattedTime:
+          type: string
+
+    FileInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        url:
+          type: string
+          example: /api/files/finance/finance-report/chart.png
+        size:
+          type: integer
+          format: int64
+          description: Size in bytes.
+        type:
+          type: string
+          description: MIME type derived from the extension.
+    FileResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        url:
+          type: string
+          description: URL of the uploaded file (upload only).
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/FileInfo"
+    RenameFileRequest:
+      type: object
+      required: [currentPath, newName]
+      properties:
+        currentPath:
+          type: string
+          description: Current attachment path (document path + file name).
+          example: finance/finance-report/chart.png
+        newName:
+          type: string
+          description: New file name, without directories.
+          example: chart-2026.png
+
+    SearchResult:
+      type: object
+      properties:
+        title:
+          type: string
+        path:
+          type: string
+          example: /finance/finance-report
+        excerpt:
+          type: string
+
+    MetadataResponse:
+      type: object
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        url:
+          type: string
+        success:
+          type: boolean
+        error:
+          type: string
+
+    WikiSettings:
+      type: object
+      required: [title, owner, notice, timezone]
+      properties:
+        title:
+          type: string
+        owner:
+          type: string
+        notice:
+          type: string
+        timezone:
+          type: string
+          description: IANA time zone.
+          example: America/Santiago
+        private:
+          type: boolean
+        disable_comments:
+          type: boolean
+        disable_file_upload_checking:
+          type: boolean
+        enable_link_embedding:
+          type: boolean
+        hide_attachments:
+          type: boolean
+        disable_content_max_width:
+          type: boolean
+        always_open_children_in_sidebar:
+          type: boolean
+        max_versions:
+          type: integer
+          description: Versions kept per document; 0 disables versioning.
+        max_upload_size:
+          type: integer
+          description: Maximum upload size in MB.
+        language:
+          type: string
+          example: en
+        log_level:
+          type: string
+          example: info
+    WikiSettingsResponse:
+      allOf:
+        - $ref: "#/components/schemas/WikiSettings"
+        - type: object
+          properties:
+            languages:
+              type: array
+              description: Available interface languages.
+              items:
+                type: string
+    SecuritySettings:
+      type: object
+      properties:
+        PasswordStrength:
+          type: integer
+          description: |
+            bcrypt cost used for new password hashes. The key is capitalized
+            because the Go field has no JSON tag.
+        login_ban:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+            max_failures:
+              type: integer
+              minimum: 1
+            window_seconds:
+              type: integer
+              minimum: 1
+            initial_ban_seconds:
+              type: integer
+              minimum: 1
+            max_ban_seconds:
+              type: integer
+              minimum: 1
+              description: Must be greater than or equal to `initial_ban_seconds`.
+
+    User:
+      type: object
+      properties:
+        username:
+          type: string
+        role:
+          $ref: "#/components/schemas/Role"
+        groups:
+          type: array
+          items:
+            type: string
+    TokenInfo:
+      type: object
+      required: [name, created_at, expired]
+      properties:
+        name:
+          type: string
+        role:
+          description: Role cap; absent means the owner's role.
+          $ref: "#/components/schemas/Role"
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          description: Absent when the token does not expire.
+        expired:
+          type: boolean
+    TokenCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+          description: Unique per user.
+        role:
+          description: Optional cap, at most the user's own role.
+          $ref: "#/components/schemas/Role"
+        expires_in_days:
+          type: integer
+          minimum: 0
+          maximum: 3650
+          default: 0
+          description: "`0` means the token does not expire."
+    UserCreateRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+          format: password
+        role:
+          $ref: "#/components/schemas/Role"
+        groups:
+          type: array
+          items:
+            type: string
+    UserUpdateRequest:
+      type: object
+      required: [username]
+      properties:
+        username:
+          type: string
+          description: User to update (cannot be changed).
+        new_password:
+          type: string
+          format: password
+          description: Optional new password.
+        role:
+          $ref: "#/components/schemas/Role"
+        groups:
+          type: array
+          items:
+            type: string
+
+    AccessRule:
+      type: object
+      required: [pattern, access]
+      properties:
+        pattern:
+          type: string
+          description: |
+            Path pattern. `*` matches within one segment, `?` one character and
+            `**` any number of segments; a trailing `/**` also matches the folder
+            itself. `/**` alone is rejected.
+          example: /finance/**
+        access:
+          type: string
+          enum: [public, private, restricted]
+          description: |
+            `public`: anyone; `private`: any logged-in user; `restricted`: only
+            members of `groups` (admins always have access).
+        groups:
+          type: array
+          items:
+            type: string
+        description:
+          type: string
+
+    ImportResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        statusUrl:
+          type: string
+          example: /api/import/status/import-1729600000000000000
+        jobId:
+          type: string
+    ImportStatus:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [processing, completed, failed]
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+        currentFile:
+          type: string
+        successCount:
+          type: integer
+        errorCount:
+          type: integer
+        importedFiles:
+          type: array
+          items:
+            type: object
+            properties:
+              originalPath:
+                type: string
+              newPath:
+                type: string
+        errors:
+          type: array
+          items:
+            type: string
+        message:
+          type: string
+
+    BackupJob:
+      type: object
+      properties:
+        id:
+          type: string
+        status:
+          type: string
+          enum: [processing, completed, failed]
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+        totalFiles:
+          type: integer
+        processedFiles:
+          type: integer
+        currentFile:
+          type: string
+        error:
+          type: string
+        filename:
+          type: string
+    BackupFile:
+      type: object
+      properties:
+        name:
+          type: string
+        size:
+          type: integer
+          format: int64
+        date:
+          type: string
+          description: Modification time, `yyyy-mm-dd hh:mm:ss`.
+          example: "2026-10-22 10:15:00"
+        url:
+          type: string
+          example: /api/backup/download/backup_20261022101500.zip

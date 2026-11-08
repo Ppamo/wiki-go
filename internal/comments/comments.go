@@ -22,10 +22,18 @@ type Comment struct {
 	FormattedTime string        // Formatted timestamp for display
 }
 
-// AddComment creates a new comment for a document.
+// ErrCommentExists reports that the user already commented on the document
+// in the same second: comment IDs are named by second and user.
+var ErrCommentExists = errors.New("comment exists")
+
+// Now is the clock that names new comments; tests replace it.
+var Now = time.Now
+
+// AddComment creates a new comment for a document. It never overwrites an
+// existing comment and returns ErrCommentExists instead.
 func AddComment(commentsRoot, documentPath, content, username string) error {
 	// Generate timestamp in YYYYMMDDhhmmss format
-	timestamp := time.Now().Format("20060102150405")
+	timestamp := Now().Format("20060102150405")
 
 	// Sanitize username for filename safety
 	safeUsername := sanitizeUsername(username)
@@ -42,8 +50,24 @@ func AddComment(commentsRoot, documentPath, content, username string) error {
 		return fmt.Errorf("failed to create comment directory: %w", err)
 	}
 
-	// Write comment content to file
-	return os.WriteFile(resolved.filePath, []byte(content), 0644)
+	// Write comment content to a new file
+	file, err := os.OpenFile(resolved.filePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if os.IsExist(err) {
+		return ErrCommentExists
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write([]byte(content)); err != nil {
+		file.Close()
+		os.Remove(resolved.filePath)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(resolved.filePath)
+		return err
+	}
+	return nil
 }
 
 // GetComments retrieves all comments for a document.

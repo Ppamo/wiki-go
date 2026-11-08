@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"wiki-go/internal/comments"
 	"wiki-go/internal/config"
@@ -290,5 +291,40 @@ func writeCommentTestDocument(t *testing.T, filename string) {
 	}
 	if err := os.WriteFile(filename, []byte("# Comment test document"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAddCommentHandlerRejectsASecondCommentInTheSameSecond(t *testing.T) {
+	testConfig := installUserSessionTestConfig(t, nil)
+	testConfig.Wiki.DocumentsDir = "documents"
+	editorCookie := sessionCookieForUser(t, testConfig, "editor", config.RoleEditor)
+	writeCommentTestDocument(t, filepath.Join(testConfig.Wiki.RootDir, "documents", "guides", "start", "document.md"))
+	previousNow := comments.Now
+	at := time.Date(2026, 10, 22, 20, 30, 0, 0, time.Local)
+	comments.Now = func() time.Time { return at }
+	t.Cleanup(func() { comments.Now = previousNow })
+
+	for _, test := range []struct {
+		content string
+		status  int
+	}{
+		{`{"content":"First"}`, http.StatusOK},
+		{`{"content":"Second"}`, http.StatusConflict},
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/api/comments/add/guides/start", strings.NewReader(test.content))
+		request.AddCookie(editorCookie)
+		response := httptest.NewRecorder()
+		AddCommentHandler(response, request)
+		if response.Code != test.status {
+			t.Fatalf("add %s status = %d, want %d; body: %s", test.content, response.Code, test.status, response.Body.String())
+		}
+	}
+
+	list, err := comments.GetComments(filepath.Join(testConfig.Wiki.RootDir, "comments"), "/guides/start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Content != "First" {
+		t.Fatalf("comments = %#v, want only the first comment", list)
 	}
 }

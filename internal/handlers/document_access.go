@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 
@@ -35,3 +36,7 @@ func attachmentDocumentPath(attachmentPath string) (string, error) {
 func canAccessLogicalDocument(rSession *auth.Session, cfg *config.Config, logicalPath string) bool {
 	return auth.CanAccessDocument(logicalPath, rSession, cfg)
 }
+
+// errSubtreeAccess vetoes a move or delete whose subtree holds documents the
+// user cannot access; handlers answer it with 403.
+var errSubtreeAccess = errors.New("the section contains documents the user cannot access")

@@ -74,8 +74,10 @@ func StartBackupHandler(w http.ResponseWriter, r *http.Request, cfg *config.Conf
 	backupJobs[jobID] = job
 	backupJobsMutex.Unlock()
 
-	// Start backup in background
-	go performBackup(jobID, filename, cfg, session.Username)
+	// The request-level configuration read lock is released when this handler
+	// returns, so give the background job its own immutable snapshot.
+	configSnapshot := *cfg
+	go performBackup(jobID, filename, &configSnapshot, session.Username)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{

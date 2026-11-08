@@ -1,9 +1,11 @@
 package comments
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestCommentOperationsUseConfiguredContainedRoot(t *testing.T) {
@@ -62,5 +64,36 @@ func TestCommentOperationsRejectUnsafePaths(t *testing.T) {
 		if err := DeleteComment(commentsRoot, commentID, documentPath, true); err == nil {
 			t.Errorf("DeleteComment(%q) succeeded, want error", documentPath)
 		}
+	}
+}
+
+func TestAddCommentNeverOverwritesAComment(t *testing.T) {
+	commentsRoot := filepath.Join(t.TempDir(), "comments")
+	previousNow := Now
+	at := time.Date(2026, 10, 22, 20, 30, 0, 0, time.Local)
+	Now = func() time.Time { return at }
+	t.Cleanup(func() { Now = previousNow })
+
+	if err := AddComment(commentsRoot, "/guides/start", "first", "editor"); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddComment(commentsRoot, "/guides/start", "second", "editor"); !errors.Is(err, ErrCommentExists) {
+		t.Fatalf("second AddComment error = %v, want ErrCommentExists", err)
+	}
+	// Another user may comment in the same second
+	if err := AddComment(commentsRoot, "/guides/start", "other", "admin"); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := GetComments(commentsRoot, "/guides/start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := map[string]string{}
+	for _, comment := range list {
+		contents[comment.Author] = comment.Content
+	}
+	if len(list) != 2 || contents["editor"] != "first" || contents["admin"] != "other" {
+		t.Fatalf("comments = %#v, want the first editor comment and the admin comment", list)
 	}
 }

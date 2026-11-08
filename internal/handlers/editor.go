@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 	"wiki-go/internal/auth"
+	"wiki-go/internal/documents"
 	"wiki-go/internal/i18n"
 	"wiki-go/internal/logger"
 	"wiki-go/internal/roles"
@@ -139,27 +141,12 @@ func SaveHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	requestPath := strings.TrimPrefix(r.URL.Path, "/api/save")
-	path := "/"
-	var docPath string
-	var relativePath string // To store path relative to the documents dir
-
-	// Special case for homepage (root path)
-	if requestPath == "" || requestPath == "/" {
-		// For the homepage, we use the pages directory
-		docPath = filepath.Join(cfg.Wiki.RootDir, "pages", "home", "document.md")
-		relativePath = "pages/home"
-	} else {
-		resolved, resolveErr := utils.ResolveRelativeDocumentPath(cfg.Wiki.RootDir, cfg.Wiki.DocumentsDir, strings.TrimPrefix(requestPath, "/"))
-		if resolveErr != nil {
-			sendJSONError(w, "Invalid document path", http.StatusBadRequest, "")
-			return
-		}
-		path = resolved.LogicalPath
-		relativePath = "documents/" + strings.TrimPrefix(path, "/")
-		docPath = filepath.Join(resolved.FilesystemPath, "document.md")
+	doc, err := documents.Resolve(cfg, strings.TrimPrefix(r.URL.Path, "/api/save"))
+	if err != nil {
+		sendJSONError(w, "Invalid document path", http.StatusBadRequest, "")
+		return
 	}
-	if !canAccessLogicalDocument(session, cfg, path) {
+	if !canAccessLogicalDocument(session, cfg, doc.LogicalPath) {
 		sendJSONError(w, "Forbidden", http.StatusForbidden, "Document access denied")
 		return
 	}
@@ -176,48 +163,11 @@ func SaveHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// VERSION CONTROL: Save current version before overwriting
-	// Check if the document already exists
-	if _, err := os.Stat(docPath); err == nil && cfg.Wiki.MaxVersions > 0 {
-		// Document exists, read its current content
-		currentContent, err := os.ReadFile(docPath)
-		if err == nil && len(currentContent) > 0 {
-			// Create timestamp for version filename
-			timestamp := time.Now().Format("20060102150405") // Format: yyyymmddhhmmss
-
-			// Create versions directory path that mirrors the document path
-			versionDir := filepath.Join(cfg.Wiki.RootDir, "versions", relativePath)
-
-			// Ensure versions directory exists
-			if err := os.MkdirAll(versionDir, 0755); err == nil {
-				// Create version file path with timestamp
-				versionPath := filepath.Join(versionDir, timestamp+".md")
-
-				// Save the current content as a version
-				_ = os.WriteFile(versionPath, currentContent, 0644) // Ignore error for now
-
-				// Log the versioning
-				logger.Info("Created version: %s", versionPath)
-
-				// Clean up old versions if needed
-				utils.CleanupOldVersions(versionDir, cfg.Wiki.MaxVersions)
-			}
-		}
-	}
-
-	// Create directory if it doesn't exist
-	dir := filepath.Dir(docPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"message": "Failed to create directory",
-		})
-		return
-	}
-
-	// Write the content to the file
-	if err := os.WriteFile(docPath, content, 0644); err != nil {
+	// The shared write path stores the previous content as a version and
+	// skips identical content
+	result, err := documents.Save(cfg, doc, content, documents.SaveOptions{})
+	if err != nil {
+		logger.Error("Error saving document %s: %v", doc.File(), err)
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": false,
@@ -226,7 +176,9 @@ func SaveHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logger.Info("User %s edited document %s", session.Username, filepath.Join(cfg.Wiki.RootDir, relativePath))
+	if !result.Unchanged {
+		logger.Info("User %s edited document %s", session.Username, doc.Dir)
+	}
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -488,10 +440,30 @@ func DeleteDocumentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Delete the file or directory recursively
 	if fileInfo.IsDir() {
-		// Use RemoveAll to recursively delete the directory and all its contents
-		if err := os.RemoveAll(fullPath); err != nil {
+		// A document or category goes with its subtree, versions and comments,
+		// and only if the user can access every directory of the subtree
+		doc, err := documents.Resolve(cfg, docPath)
+		if err != nil {
+			sendJSONError(w, "Invalid document path", http.StatusBadRequest, "")
+			return
+		}
+		_, err = documents.Delete(cfg, doc, documents.DeleteOptions{Recursive: true}, func(dirs []string) error {
+			for _, dir := range dirs {
+				if !canAccessLogicalDocument(session, cfg, dir) {
+					return errSubtreeAccess
+				}
+			}
+			return nil
+		})
+		switch {
+		case errors.Is(err, errSubtreeAccess):
+			sendJSONError(w, "Forbidden", http.StatusForbidden, "Document access denied")
+			return
+		case errors.Is(err, documents.ErrNotFound):
+			sendJSONError(w, "Document not found", http.StatusNotFound, "")
+			return
+		case err != nil:
 			sendJSONError(w, "Error deleting directory", http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -503,45 +475,45 @@ func DeleteDocumentHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		logger.Info("User %s deleted document %s", session.Username, fullPath)
-	}
 
-	// Also delete the corresponding versions directory
-	var versionsPath string
-	if relativeDocPath == "pages/home" {
-		// For homepage, use the new path
-		versionsPath = filepath.Join(cfg.Wiki.RootDir, "versions", "pages", "home")
-	} else if strings.HasPrefix(relativeDocPath, "documents/") {
-		// Path already includes "documents/" prefix
-		versionsPath = filepath.Join(cfg.Wiki.RootDir, "versions", relativeDocPath)
-	} else {
-		// Add "documents/" prefix for regular documents
-		versionsPath = filepath.Join(cfg.Wiki.RootDir, "versions", "documents", relativeDocPath)
-		if strings.HasSuffix(fullPath, ".md") {
-			// If we're deleting a .md file, remove the .md extension from the versions path
-			versionsPath = filepath.Join(cfg.Wiki.RootDir, "versions", "documents", strings.TrimSuffix(relativeDocPath, ".md"))
-		}
-	}
-
-	// Check if versions directory exists before attempting to delete
-	if _, err := os.Stat(versionsPath); err == nil {
-		if err := os.RemoveAll(versionsPath); err != nil {
-			logger.Warn("Failed to delete versions directory: %s - %v", versionsPath, err)
-			// Continue execution even if versions deletion fails
+		// Also delete the corresponding versions directory
+		var versionsPath string
+		if relativeDocPath == "pages/home" {
+			// For homepage, use the new path
+			versionsPath = filepath.Join(cfg.Wiki.RootDir, "versions", "pages", "home")
+		} else if strings.HasPrefix(relativeDocPath, "documents/") {
+			// Path already includes "documents/" prefix
+			versionsPath = filepath.Join(cfg.Wiki.RootDir, "versions", relativeDocPath)
 		} else {
-			logger.Info("Deleted versions directory: %s", versionsPath)
+			// Add "documents/" prefix for regular documents
+			versionsPath = filepath.Join(cfg.Wiki.RootDir, "versions", "documents", relativeDocPath)
+			if strings.HasSuffix(fullPath, ".md") {
+				// If we're deleting a .md file, remove the .md extension from the versions path
+				versionsPath = filepath.Join(cfg.Wiki.RootDir, "versions", "documents", strings.TrimSuffix(relativeDocPath, ".md"))
+			}
 		}
-	}
 
-	// Also delete the corresponding comments directory
-	commentsPath := filepath.Join(cfg.Wiki.RootDir, "comments", relativeDocPath)
+		// Check if versions directory exists before attempting to delete
+		if _, err := os.Stat(versionsPath); err == nil {
+			if err := os.RemoveAll(versionsPath); err != nil {
+				logger.Warn("Failed to delete versions directory: %s - %v", versionsPath, err)
+				// Continue execution even if versions deletion fails
+			} else {
+				logger.Info("Deleted versions directory: %s", versionsPath)
+			}
+		}
 
-	// Check if comments directory exists before attempting to delete
-	if _, err := os.Stat(commentsPath); err == nil {
-		if err := os.RemoveAll(commentsPath); err != nil {
-			logger.Warn("Failed to delete comments directory: %s - %v", commentsPath, err)
-			// Continue execution even if comments deletion fails
-		} else {
-			logger.Info("Deleted comments directory: %s", commentsPath)
+		// Also delete the corresponding comments directory
+		commentsPath := filepath.Join(cfg.Wiki.RootDir, "comments", relativeDocPath)
+
+		// Check if comments directory exists before attempting to delete
+		if _, err := os.Stat(commentsPath); err == nil {
+			if err := os.RemoveAll(commentsPath); err != nil {
+				logger.Warn("Failed to delete comments directory: %s - %v", commentsPath, err)
+				// Continue execution even if comments deletion fails
+			} else {
+				logger.Info("Deleted comments directory: %s", commentsPath)
+			}
 		}
 	}
 

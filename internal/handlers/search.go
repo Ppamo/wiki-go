@@ -34,13 +34,14 @@ func SearchHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
 	}
 
 	session := auth.GetSession(r)
-	results := performSearch(req.Query, session, cfg)
+	results := PerformSearch(req.Query, session, cfg)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(results)
 }
 
-func performSearch(query string, session *auth.Session, cfg *config.Config) []SearchResult {
+// PerformSearch returns the documents matching query that the session may access.
+func PerformSearch(query string, session *auth.Session, cfg *config.Config) []SearchResult {
 	var results []SearchResult
 	searchTerms := parseSearchQuery(query)
 
@@ -52,15 +53,15 @@ func performSearch(query string, session *auth.Session, cfg *config.Config) []Se
 			return err
 		}
 
-		// Only process markdown files
-		if !info.IsDir() && strings.HasSuffix(strings.ToLower(path), ".md") {
-			// Compute the document's URL path first for access checking
-			cleanPath := path
-			cleanPath = strings.ReplaceAll(cleanPath, "\\", "/")
-			prefix := strings.ReplaceAll(docsPath, "\\", "/") + "/"
-			cleanPath = strings.TrimPrefix(cleanPath, prefix)
-			cleanPath = strings.TrimSuffix(strings.Replace(cleanPath, "document.md", "", 1), ".md")
-			urlPath := "/" + cleanPath
+		// A wiki document is represented by a directory containing document.md.
+		// Ignore other Markdown files so attachments cannot be indexed under a
+		// different logical path than the document that owns them.
+		if !info.IsDir() && info.Name() == "document.md" {
+			relativeDir, err := filepath.Rel(docsPath, filepath.Dir(path))
+			if err != nil || relativeDir == "." {
+				return nil
+			}
+			urlPath := "/" + filepath.ToSlash(relativeDir)
 
 			// Skip documents the user cannot access
 			if !auth.CanAccessDocument(urlPath, session, cfg) {
